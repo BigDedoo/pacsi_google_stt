@@ -5,7 +5,6 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import colorchooser
-
 from google.cloud import speech, translate
 import pyaudio
 
