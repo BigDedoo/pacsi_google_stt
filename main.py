@@ -12,14 +12,10 @@ import pyaudio
 RATE = 16000
 CHUNK = RATE // 20  # Reduced chunk size for lower latency (50ms updates)
 
-# Global settings for language & color
-selected_translation = "fr-en"  # Default: French to English
-subtitle_color = "white"  # Default subtitle color
-exit_flag = False  # Global flag to signal exit
-
 
 class MicrophoneStream:
     """Opens a recording stream as a generator yielding audio chunks."""
+
     def __init__(self, rate: int = RATE, chunk: int = CHUNK) -> None:
         self._rate = rate
         self._chunk = chunk
@@ -67,7 +63,7 @@ class MicrophoneStream:
             yield b"".join(data)
 
 
-def translate_text(texts: list[str], target_language: str) -> list[str]:
+def translate_text(texts: list[str], target_language: str = "en") -> list[str]:
     """Batch translation to reduce API calls & latency."""
     client = translate.TranslationServiceClient()
     project_id = "stttesting-445210"
@@ -83,12 +79,8 @@ def translate_text(texts: list[str], target_language: str) -> list[str]:
     return [html.unescape(translation.translated_text) for translation in response.translations]
 
 
-def listen_print_loop(responses, transcript_queue):
-    global exit_flag
+def listen_print_loop(responses, transcript_queue, target_language_code):
     num_chars_printed = 0
-
-    # Set the language direction based on user selection
-    source_language, target_language = selected_translation.split("-")
 
     for response in responses:
         if not response.results:
@@ -102,110 +94,106 @@ def listen_print_loop(responses, transcript_queue):
         overwrite_chars = " " * (num_chars_printed - len(transcript))
 
         if not result.is_final:
+            # For interim results, send the transcript as is.
             transcript_queue.put(transcript + overwrite_chars)
             num_chars_printed = len(transcript)
         else:
-            # Check if transcript is empty; if so, skip translation
-            if not transcript.strip():
-                num_chars_printed = 0
-                continue
-
-            translations = translate_text([transcript], target_language=target_language)
+            # Translate the final transcript.
+            translations = translate_text([transcript], target_language=target_language_code)
             translated_text = translations[0] if translations else transcript
             transcript_queue.put(translated_text)
 
             if re.search(r"\b(exit|quit)\b", transcript, re.I):
                 transcript_queue.put("Exiting..")
-                exit_flag = True
                 break
 
             num_chars_printed = 0
 
-    # Only signal termination if we're actually exiting
-    if exit_flag:
-        transcript_queue.put(None)
+    transcript_queue.put(None)
 
 
-def run_transcription(transcript_queue):
-    """Runs the speech recognition and passes results to the queue.
-       This version restarts the microphone stream for each utterance (final result)
-       by setting single_utterance=True.
-    """
-    global exit_flag
+def run_transcription(transcript_queue, source_language_code, target_language_code):
+    """Runs the speech recognition and passes results to the queue."""
     client = speech.SpeechClient()
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=RATE,
+        language_code=source_language_code,
+        enable_automatic_punctuation=True,
+    )
+    streaming_config = speech.StreamingRecognitionConfig(
+        config=config, interim_results=True, single_utterance=False
+    )
 
-    while not exit_flag:
-        source_language, _ = selected_translation.split("-")
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=RATE,
-            language_code=source_language,  # Adjust dynamically
-            enable_automatic_punctuation=True,
+    with MicrophoneStream(RATE, CHUNK) as stream:
+        audio_generator = stream.generator()
+        requests = (
+            speech.StreamingRecognizeRequest(audio_content=content)
+            for content in audio_generator
         )
-        # Force end-of-utterance detection by enabling single_utterance
-        streaming_config = speech.StreamingRecognitionConfig(
-            config=config, interim_results=True, single_utterance=True
-        )
-
-        with MicrophoneStream(RATE, CHUNK) as stream:
-            audio_generator = stream.generator()
-            requests = (
-                speech.StreamingRecognizeRequest(audio_content=content)
-                for content in audio_generator
-            )
-            responses = client.streaming_recognize(streaming_config, requests)
-            listen_print_loop(responses, transcript_queue)
+        responses = client.streaming_recognize(streaming_config, requests)
+        listen_print_loop(responses, transcript_queue, target_language_code)
 
 
-def settings_window(root):
-    """Pop-up window for selecting language direction and subtitle color."""
-    global selected_translation, subtitle_color
+def choose_color(subtitle_color_var, button):
+    color = colorchooser.askcolor(title="Choose subtitle color")[1]
+    if color:
+        subtitle_color_var.set(color)
+        button.config(bg=color)
 
-    def apply_settings():
-        global selected_translation, subtitle_color
-        selected_translation = lang_var.get()
-        subtitle_color = color_var.get()
-        settings.destroy()  # Close settings before starting subtitles
 
-    def choose_color():
-        color_code = colorchooser.askcolor(title="Choose Text Color")[1]
-        if color_code:
-            color_var.set(color_code)
+def show_settings():
+    settings_root = tk.Tk()
+    settings_root.title("Settings")
 
-    settings = tk.Toplevel(root)
-    settings.title("Settings")
-    settings.geometry("300x200")
+    direction_var = tk.StringVar(value="fr_to_en")
+    subtitle_color_var = tk.StringVar(value="white")
 
-    tk.Label(settings, text="Select Translation Mode:").pack(pady=5)
+    tk.Label(settings_root, text="Select Translation Direction:").pack(pady=5)
+    tk.Radiobutton(settings_root, text="French to English", variable=direction_var, value="fr_to_en").pack()
+    tk.Radiobutton(settings_root, text="English to French", variable=direction_var, value="en_to_fr").pack()
 
-    lang_var = tk.StringVar(value=selected_translation)
-    tk.Radiobutton(settings, text="French ➝ English", variable=lang_var, value="fr-en").pack()
-    tk.Radiobutton(settings, text="English ➝ French", variable=lang_var, value="en-fr").pack()
+    tk.Label(settings_root, text="Subtitle Color:").pack(pady=5)
+    color_frame = tk.Frame(settings_root)
+    color_frame.pack()
+    color_button = tk.Button(color_frame, text="Choose Color",
+                             command=lambda: choose_color(subtitle_color_var, color_button))
+    color_button.pack()
 
-    tk.Label(settings, text="Choose Subtitle Color:").pack(pady=5)
+    def on_ok():
+        settings_root.quit()
 
-    color_var = tk.StringVar(value=subtitle_color)
-    tk.Button(settings, text="Pick a Color", command=choose_color).pack(pady=5)
+    tk.Button(settings_root, text="OK", command=on_ok).pack(pady=10)
 
-    tk.Button(settings, text="Apply", command=apply_settings).pack(pady=10)
+    settings_root.mainloop()
 
-    settings.grab_set()  # Prevents interaction with the main window
+    direction = direction_var.get()
+    subtitle_color = subtitle_color_var.get()
+
+    if direction == "fr_to_en":
+        source_language_code = "fr-BE"
+        target_language_code = "en"
+    else:
+        source_language_code = "en"
+        target_language_code = "fr-BE"
+
+    settings_root.destroy()
+    return source_language_code, target_language_code, subtitle_color
 
 
 def main():
-    """Main application logic."""
-    root = tk.Tk()
-    root.withdraw()  # Hide main window until settings are selected
-
-    settings_window(root)  # Open settings first
-
-    root.deiconify()  # Show the main window after settings are closed
+    # Show the settings window and get user preferences.
+    source_language_code, target_language_code, subtitle_color = show_settings()
 
     transcript_queue = queue.Queue()
-    transcription_thread = threading.Thread(target=run_transcription, args=(transcript_queue,))
+    transcription_thread = threading.Thread(
+        target=run_transcription,
+        args=(transcript_queue, source_language_code, target_language_code)
+    )
     transcription_thread.start()
 
     # Create a borderless, transparent overlay window for subtitles.
+    root = tk.Tk()
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     root.config(bg="black")
@@ -226,7 +214,7 @@ def main():
         root,
         text="",
         font=("Helvetica", 28),
-        fg=subtitle_color,  # Apply user-selected color
+        fg=subtitle_color,
         bg="black",
         wraplength=screen_width - 100,
         justify="center"
@@ -234,17 +222,16 @@ def main():
     subtitle_label.pack(expand=True, fill="both")
 
     def poll_queue():
-        """Checks the transcript queue and updates subtitles in real-time."""
         try:
             while True:
                 message = transcript_queue.get_nowait()
                 if message is None:
                     root.quit()
                     return
-                subtitle_label.config(text=message, fg=subtitle_color)  # Update text color
+                subtitle_label.config(text=message)
         except queue.Empty:
             pass
-        root.after(25, poll_queue)  # Faster polling for better UI updates
+        root.after(25, poll_queue)
 
     poll_queue()
     root.mainloop()
