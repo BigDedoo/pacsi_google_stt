@@ -1,6 +1,7 @@
 import sys
 import os
 import time  # Added to allow a delay before restarting the audio stream
+import keyboard  # For global hotkeys
 
 # If running as a bundled executable, set the credentials path to the extracted file.
 if getattr(sys, 'frozen', False):
@@ -28,11 +29,11 @@ CHUNK = RATE // 20  # 50ms updates
 # Global control event and transcription thread holder.
 stop_event = threading.Event()
 transcription_thread = None
+overlay = None  # Global variable to hold the overlay window
 
 
 class MicrophoneStream:
     """Opens a recording stream as a generator yielding audio chunks."""
-
     def __init__(self, rate: int = RATE, chunk: int = CHUNK, input_device_index: int = None) -> None:
         self._rate = rate
         self._chunk = chunk
@@ -61,7 +62,7 @@ class MicrophoneStream:
         # Unblock any pending queue operations.
         self._buff.put(None)
         self._audio_interface.terminate()
-        del self._audio_interface  # Add this
+        del self._audio_interface  # Ensure complete cleanup
 
     def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
         self._buff.put(in_data)
@@ -110,6 +111,8 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
     exit_flag = False
 
     for response in responses:
+        if stop_event.is_set():
+            break
         if not response.results:
             continue
         result = response.results[0]
@@ -165,6 +168,8 @@ def run_transcription(transcript_queue, source_language_code, target_language_co
     while True:
         if stop_event.is_set():
             break
+        print("Restarting stream...")
+
         try:
             try:
                 with MicrophoneStream(rate=sample_rate, chunk=chunk, input_device_index=input_device_index) as stream:
@@ -294,13 +299,6 @@ def stop_transcription_thread():
         transcription_thread = None
 
 
-def key_handler(event, root):
-    # Debug output to verify the event.
-    print(f"Key event triggered: keysym={event.keysym}, state={event.state}")
-    stop_transcription_thread()
-    root.destroy()
-
-
 def create_overlay(subtitle_color, chosen_stop_key):
     # Create a borderless, transparent overlay window for subtitles.
     root = tk.Tk()
@@ -330,10 +328,10 @@ def create_overlay(subtitle_color, chosen_stop_key):
     )
     subtitle_label.pack(expand=True, fill="both")
 
-    # Force focus and bind the user-chosen key.
+    # Force focus.
     root.after(100, lambda: root.focus_force())
-    binding_str = f"<{chosen_stop_key}>"
-    root.bind_all(binding_str, lambda event: key_handler(event, root))
+
+    # No local key binding is required since the global hotkey will work even if the overlay isn't focused.
 
     def poll_queue():
         try:
@@ -351,7 +349,24 @@ def create_overlay(subtitle_color, chosen_stop_key):
     return root
 
 
+def global_stop_handler():
+    print("Global hotkey triggered: Alt-F11. Exiting...")
+    stop_transcription_thread()
+    try:
+        global overlay
+        if overlay is not None:
+            overlay.destroy()
+    except Exception as e:
+        print("Error closing overlay:", e)
+    sys.exit(0)
+
+
 def main():
+    global overlay
+    overlay = None
+    # Register the global hotkey for Alt-F11.
+    keyboard.add_hotkey('alt+f11', global_stop_handler)
+
     # Main loop that cycles between settings and overlay.
     while True:
         config = show_settings()
@@ -359,15 +374,12 @@ def main():
             break
         source_language_code, target_language_code, subtitle_color, input_device_index, chosen_stop_key = config
 
-        # Add a short delay to allow the audio device to be released before restarting transcription.
-        time.sleep(1)
-
         # Start transcription.
         start_transcription_thread(source_language_code, target_language_code, input_device_index)
 
         # Create the overlay window.
         overlay = create_overlay(subtitle_color, chosen_stop_key)
-        overlay.mainloop()  # Runs until the overlay is destroyed (via the key bind).
+        overlay.mainloop()  # Runs until the overlay is destroyed.
 
         stop_transcription_thread()
         # Loop back to show settings again.
