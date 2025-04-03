@@ -2,6 +2,14 @@ import sys
 import os
 import time  # Added to allow a delay before restarting the audio stream
 import keyboard  # For global hotkeys
+import html
+import queue
+import re
+import threading
+from PyQt5 import QtWidgets, QtGui, QtCore  # Using PyQt for settings dialog
+import pyaudio
+from google.cloud import speech, translate
+
 
 # If running as a bundled executable, set the credentials path to the extracted file.
 if getattr(sys, 'frozen', False):
@@ -12,13 +20,6 @@ else:
 credentials_path = os.path.join(base_path, "stttesting-445210-aa5e435ad2b1.json")
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
 
-import html
-import queue
-import re
-import threading
-from PyQt5 import QtWidgets, QtGui, QtCore  # Using PyQt for settings dialog
-import pyaudio
-from google.cloud import speech, translate
 
 # Audio recording parameters
 RATE = 16000
