@@ -16,11 +16,9 @@ import html
 import queue
 import re
 import threading
-import tkinter as tk
-from tkinter import colorchooser
-
-from google.cloud import speech, translate
+from PyQt5 import QtWidgets, QtGui, QtCore  # Using PyQt for settings dialog
 import pyaudio
+from google.cloud import speech, translate
 
 # Audio recording parameters
 RATE = 16000
@@ -29,8 +27,6 @@ CHUNK = RATE // 20  # 50ms updates
 # Global control event and transcription thread holder.
 stop_event = threading.Event()
 transcription_thread = None
-overlay = None  # Global variable to hold the overlay window
-
 
 class MicrophoneStream:
     """Opens a recording stream as a generator yielding audio chunks."""
@@ -195,88 +191,6 @@ def run_transcription(transcript_queue, source_language_code, target_language_co
                 raise e
 
 
-def choose_color(subtitle_color_var, button):
-    color = colorchooser.askcolor(title="Choose Subtitle Color")[1]
-    if color:
-        subtitle_color_var.set(color)
-        button.config(bg=color)
-
-
-def show_settings():
-    settings_root = tk.Tk()
-    settings_root.title("Settings")
-
-    direction_var = tk.StringVar(value="fr_to_en")
-    subtitle_color_var = tk.StringVar(value="white")
-    # Display the default keybind that stops transcription; user can change it.
-    stop_key_var = tk.StringVar(value="Alt-F11")
-
-    # List available input devices using PyAudio.
-    pya_instance = pyaudio.PyAudio()
-    devices = {}
-    default_device_name = None
-    try:
-        default_info = pya_instance.get_default_input_device_info()
-        default_device_name = default_info["name"]
-    except Exception:
-        pass
-
-    for i in range(pya_instance.get_device_count()):
-        info = pya_instance.get_device_info_by_index(i)
-        if info.get("maxInputChannels", 0) > 0:
-            devices[info["name"]] = info["index"]
-    pya_instance.terminate()
-
-    device_names = list(devices.keys())
-    if default_device_name is None and device_names:
-        default_device_name = device_names[0]
-
-    input_device_var = tk.StringVar(value=default_device_name)
-
-    tk.Label(settings_root, text="Select Translation Direction:").pack(pady=5)
-    tk.Radiobutton(settings_root, text="French to English", variable=direction_var, value="fr_to_en").pack()
-    tk.Radiobutton(settings_root, text="English to French", variable=direction_var, value="en_to_fr").pack()
-
-    tk.Label(settings_root, text="Subtitle Color:").pack(pady=5)
-    color_frame = tk.Frame(settings_root)
-    color_frame.pack()
-    color_button = tk.Button(color_frame, text="Choose Color",
-                             command=lambda: choose_color(subtitle_color_var, color_button))
-    color_button.pack()
-
-    tk.Label(settings_root, text="Select Input Device:").pack(pady=5)
-    device_menu = tk.OptionMenu(settings_root, input_device_var, *device_names)
-    device_menu.pack(pady=5)
-
-    tk.Label(settings_root, text="Stop Transcription Key (e.g., Alt-F11):").pack(pady=5)
-    tk.Entry(settings_root, textvariable=stop_key_var, state="disabled").pack(pady=5)
-
-    tk.Button(settings_root, text="OK", command=settings_root.destroy).pack(pady=10)
-
-    def on_close():
-        stop_transcription_thread()
-        settings_root.destroy()
-        sys.exit(0)
-
-    settings_root.protocol("WM_DELETE_WINDOW", on_close)
-    settings_root.mainloop()
-
-    direction = direction_var.get()
-    subtitle_color = subtitle_color_var.get()
-    selected_device_name = input_device_var.get()
-    input_device_index = devices.get(selected_device_name, None)
-    chosen_stop_key = stop_key_var.get()
-
-    if direction == "fr_to_en":
-        source_language_code = "fr-BE"
-        target_language_code = "en"
-    else:
-        source_language_code = "en"
-        target_language_code = "fr-BE"
-
-    return source_language_code, target_language_code, subtitle_color, input_device_index, chosen_stop_key
-
-
 def start_transcription_thread(source_language_code, target_language_code, input_device_index):
     global transcription_thread, transcript_queue
     transcript_queue = queue.Queue()
@@ -300,7 +214,7 @@ def stop_transcription_thread():
 
 
 def create_overlay(subtitle_color, chosen_stop_key):
-    # Create a borderless, transparent overlay window for subtitles.
+    import tkinter as tk  # Still using Tkinter for the overlay
     root = tk.Tk()
     root.overrideredirect(True)
     root.attributes("-topmost", True)
@@ -328,37 +242,153 @@ def create_overlay(subtitle_color, chosen_stop_key):
     )
     subtitle_label.pack(expand=True, fill="both")
 
-    # Force focus.
     root.after(100, lambda: root.focus_force())
-
-    # No local key binding is required since the global hotkey will work even if the overlay isn't focused.
 
     def poll_queue():
         try:
             while True:
                 message = transcript_queue.get_nowait()
                 if message is None:
-                    root.quit()
+                    if root.winfo_exists():
+                        root.quit()
                     return
                 subtitle_label.config(text=message)
         except queue.Empty:
             pass
-        root.after(25, poll_queue)
+        try:
+            # Only schedule the next callback if the window still exists.
+            if root.winfo_exists():
+                root.after(25, poll_queue)
+        except tk.TclError:
+            # The widget has been destroyed, so just exit.
+            pass
 
     poll_queue()
     return root
 
 
 def global_stop_handler():
-    print("Global hotkey triggered: Alt-F11. Exiting...")
+    print("Global hotkey triggered: Alt-F11. Stopping transcription and returning to settings...")
     stop_transcription_thread()
     try:
         global overlay
         if overlay is not None:
             overlay.destroy()
+            overlay = None
     except Exception as e:
         print("Error closing overlay:", e)
-    sys.exit(0)
+
+
+def show_settings():
+    """
+    Displays a PyQt-based settings dialog.
+    Returns:
+      (source_language_code, target_language_code, subtitle_color, input_device_index, chosen_stop_key)
+      or None if the dialog was cancelled.
+    """
+    # Create a QApplication if one does not exist.
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication(sys.argv)
+
+    class SettingsDialog(QtWidgets.QDialog):
+        def __init__(self, parent=None):
+            super(SettingsDialog, self).__init__(parent)
+            self.setWindowTitle("Settings")
+            self.setModal(True)
+            self.resize(400, 300)
+            layout = QtWidgets.QVBoxLayout()
+
+            # Translation Direction
+            layout.addWidget(QtWidgets.QLabel("Select Translation Direction:"))
+            self.radio_fr_to_en = QtWidgets.QRadioButton("French to English")
+            self.radio_en_to_fr = QtWidgets.QRadioButton("English to French")
+            self.radio_fr_to_en.setChecked(True)
+            layout.addWidget(self.radio_fr_to_en)
+            layout.addWidget(self.radio_en_to_fr)
+
+            # Subtitle Color with preview
+            self.subtitle_color = "white"
+            color_layout = QtWidgets.QHBoxLayout()
+            color_layout.addWidget(QtWidgets.QLabel("Subtitle Color:"))
+
+            # Add a color preview label
+            self.color_preview = QtWidgets.QLabel()
+            self.color_preview.setFixedSize(40, 20)
+            self.color_preview.setStyleSheet("background-color: white; border: 1px solid black;")
+            color_layout.addWidget(self.color_preview)
+
+            self.color_button = QtWidgets.QPushButton("Choose Color")
+            self.color_button.clicked.connect(self.choose_color)
+            color_layout.addWidget(self.color_button)
+            layout.addLayout(color_layout)
+
+            # Input Device Selection
+            layout.addWidget(QtWidgets.QLabel("Select Input Device:"))
+            self.input_device_combo = QtWidgets.QComboBox()
+            self.devices = {}
+            pya_instance = pyaudio.PyAudio()
+            default_device_name = None
+            try:
+                default_info = pya_instance.get_default_input_device_info()
+                default_device_name = default_info["name"]
+            except Exception:
+                pass
+
+            for i in range(pya_instance.get_device_count()):
+                info = pya_instance.get_device_info_by_index(i)
+                if info.get("maxInputChannels", 0) > 0:
+                    device_name = info["name"]
+                    self.devices[device_name] = info["index"]
+                    self.input_device_combo.addItem(device_name)
+            pya_instance.terminate()
+            layout.addWidget(self.input_device_combo)
+
+            # Stop Transcription Key (read-only)
+            layout.addWidget(QtWidgets.QLabel("Stop Transcription Key (e.g., Alt-F11):"))
+            self.stop_key = "Alt-F11"
+            self.stop_key_edit = QtWidgets.QLineEdit(self.stop_key)
+            self.stop_key_edit.setReadOnly(True)
+            layout.addWidget(self.stop_key_edit)
+
+            # OK Button
+            self.ok_button = QtWidgets.QPushButton("OK")
+            self.ok_button.clicked.connect(self.accept)
+            layout.addWidget(self.ok_button)
+
+            self.setLayout(layout)
+
+        def choose_color(self):
+            # Pass self as the parent to ensure the color dialog stays on top of the settings window.
+            color = QtWidgets.QColorDialog.getColor(parent=self)
+            if color.isValid():
+                self.subtitle_color = color.name()
+                self.color_preview.setStyleSheet(
+                    f"background-color: {self.subtitle_color}; border: 1px solid black;"
+                )
+
+    dialog = SettingsDialog()
+    # Force the dialog to appear in front
+    dialog.setWindowFlags(dialog.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+    dialog.show()
+    dialog.raise_()
+    result = dialog.exec_()
+
+    if result == QtWidgets.QDialog.Accepted:
+        direction = "fr_to_en" if dialog.radio_fr_to_en.isChecked() else "en_to_fr"
+        subtitle_color = dialog.subtitle_color
+        selected_device_name = dialog.input_device_combo.currentText()
+        input_device_index = dialog.devices.get(selected_device_name, None)
+        chosen_stop_key = dialog.stop_key
+        if direction == "fr_to_en":
+            source_language_code = "fr-BE"
+            target_language_code = "en"
+        else:
+            source_language_code = "en"
+            target_language_code = "fr-BE"
+        return source_language_code, target_language_code, subtitle_color, input_device_index, chosen_stop_key
+    else:
+        return None
 
 
 def main():
