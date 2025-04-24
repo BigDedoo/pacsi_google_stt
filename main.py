@@ -102,10 +102,23 @@ def translate_text(texts: list[str], target_language: str = "en") -> list[str]:
     )
     return [html.unescape(translation.translated_text) for translation in response.translations]
 
+def log_translation(source: str, translation: str, filename: str = "translation_log.txt") -> None:
+    """Append the original text and its translation to a log file."""
+    with open(filename, "a", encoding="utf-8") as f:
+        f.write(f"Source: {source}\nTranslation: {translation}\n\n")
 
 def listen_print_loop(responses, transcript_queue, target_language_code):
+    # Throttle interval for translating interim results (in seconds)
+    TRANSLATION_INTERVAL = 1.0
+    last_translate_time = time.time() - TRANSLATION_INTERVAL
+    last_translated_text = ""
     num_chars_printed = 0
     exit_flag = False
+
+    def sentence_finished(text):
+        # Check if the text, once trimmed, ends with punctuation indicating sentence completion.
+        text = text.strip()
+        return text.endswith('.') or text.endswith('!') or text.endswith('?')
 
     for response in responses:
         if stop_event.is_set():
@@ -117,14 +130,15 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
             continue
 
         transcript = result.alternatives[0].transcript
-        overwrite_chars = " " * (num_chars_printed - len(transcript))
 
-        if not result.is_final:
-            transcript_queue.put(transcript + overwrite_chars)
-            num_chars_printed = len(transcript)
-        else:
+        # Trigger immediate translation if the result is final or the sentence appears finished.
+        if result.is_final or sentence_finished(transcript):
             translations = translate_text([transcript], target_language=target_language_code)
             translated_text = translations[0] if translations else transcript
+
+            # Log the original transcript and its translation.
+            log_translation(transcript, translated_text)
+
             transcript_queue.put(translated_text)
 
             if re.search(r"\b(exit|quit)\b", transcript, re.I):
@@ -133,10 +147,29 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
                 break
 
             num_chars_printed = 0
+            last_translated_text = translated_text
+            last_translate_time = time.time()
+        else:
+            current_time = time.time()
+            # Use throttled translation for interim updates that don't indicate sentence completion.
+            if current_time - last_translate_time >= TRANSLATION_INTERVAL:
+                translations = translate_text([transcript], target_language=target_language_code)
+                translated_text = translations[0] if translations else transcript
+                last_translate_time = current_time
+                last_translated_text = translated_text
+                num_chars_printed = len(translated_text)
+            else:
+                translated_text = last_translated_text if last_translated_text else transcript
+
+            overwrite_chars = (
+                " " * (num_chars_printed - len(translated_text))
+                if num_chars_printed > len(translated_text)
+                else ""
+            )
+            transcript_queue.put(translated_text + overwrite_chars)
 
     transcript_queue.put(None)
     return exit_flag
-
 
 def run_transcription(transcript_queue, source_language_code, target_language_code, input_device_index):
     # Determine sample rate from the selected device, or use the default RATE.
@@ -227,11 +260,12 @@ def create_overlay(subtitle_color, chosen_stop_key):
 
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
-    window_height = 100
+    window_height = 200  # Increased height to accommodate longer text
     x_pos = 0
     y_pos = screen_height - window_height - 50
     root.geometry(f"{screen_width}x{window_height}+{x_pos}+{y_pos}")
 
+    # Create a fixed-size label placed in the center.
     subtitle_label = tk.Label(
         root,
         text="",
@@ -239,11 +273,11 @@ def create_overlay(subtitle_color, chosen_stop_key):
         fg=subtitle_color,
         bg="black",
         wraplength=screen_width - 100,
-        justify="center"
+        justify="center",
+        anchor="center"
     )
-    subtitle_label.pack(expand=True, fill="both")
-
-    root.after(100, lambda: root.focus_force())
+    # Use place() to fix the label size and position
+    subtitle_label.place(relx=0.5, rely=0.5, anchor="center", width=screen_width-100, height=window_height)
 
     def poll_queue():
         try:
@@ -253,32 +287,24 @@ def create_overlay(subtitle_color, chosen_stop_key):
                     if root.winfo_exists():
                         root.quit()
                     return
+                # Update label text without affecting its size or position.
                 subtitle_label.config(text=message)
         except queue.Empty:
             pass
         try:
-            # Only schedule the next callback if the window still exists.
             if root.winfo_exists():
                 root.after(25, poll_queue)
         except tk.TclError:
-            # The widget has been destroyed, so just exit.
             pass
 
     poll_queue()
     return root
 
 
-def global_stop_handler():
-    print("Global hotkey triggered: Alt-F11. Stopping transcription and returning to settings...")
-    stop_transcription_thread()
-    try:
-        global overlay
-        if overlay is not None:
-            overlay.destroy()
-            overlay = None
-    except Exception as e:
-        print("Error closing overlay:", e)
 
+def global_stop_handler():
+    print("Global hotkey triggered: Alt-F11. Exiting application.")
+    os._exit(0)
 
 def show_settings():
     """
