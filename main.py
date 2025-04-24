@@ -224,7 +224,6 @@ def run_transcription(transcript_queue, source_language_code, target_language_co
             else:
                 raise e
 
-
 def start_transcription_thread(source_language_code, target_language_code, input_device_index):
     global transcription_thread, transcript_queue
     transcript_queue = queue.Queue()
@@ -236,7 +235,6 @@ def start_transcription_thread(source_language_code, target_language_code, input
     transcription_thread.daemon = True
     transcription_thread.start()
 
-
 def stop_transcription_thread():
     global transcription_thread
     stop_event.set()
@@ -245,7 +243,6 @@ def stop_transcription_thread():
         if transcription_thread.is_alive():
             print("Warning: Transcription thread did not terminate in time.")
         transcription_thread = None
-
 
 def create_overlay(subtitle_color, chosen_stop_key):
     import tkinter as tk  # Still using Tkinter for the overlay
@@ -276,7 +273,6 @@ def create_overlay(subtitle_color, chosen_stop_key):
         justify="center",
         anchor="center"
     )
-    # Use place() to fix the label size and position
     subtitle_label.place(relx=0.5, rely=0.5, anchor="center", width=screen_width-100, height=window_height)
 
     def poll_queue():
@@ -287,8 +283,10 @@ def create_overlay(subtitle_color, chosen_stop_key):
                     if root.winfo_exists():
                         root.quit()
                     return
-                # Update label text without affecting its size or position.
-                subtitle_label.config(text=message)
+                # Only show one sentence: split on end-of-sentence punctuation and take the last segment.
+                segments = re.split(r'(?<=[\.!?])\s+', message.strip())
+                to_display = segments[-1] if segments else message
+                subtitle_label.config(text=to_display)
         except queue.Empty:
             pass
         try:
@@ -299,8 +297,6 @@ def create_overlay(subtitle_color, chosen_stop_key):
 
     poll_queue()
     return root
-
-
 
 def global_stop_handler():
     print("Global hotkey triggered: Alt-F11. Exiting application.")
@@ -395,7 +391,6 @@ def show_settings():
                 )
 
     dialog = SettingsDialog()
-    # Force the dialog to appear in front
     dialog.setWindowFlags(dialog.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
     dialog.show()
     dialog.raise_()
@@ -411,7 +406,7 @@ def show_settings():
             source_language_code = "fr-BE"
             target_language_code = "en"
         else:
-            source_language_code = "en"
+            source_language_code = "en-US"
             target_language_code = "fr-BE"
         return source_language_code, target_language_code, subtitle_color, input_device_index, chosen_stop_key
     else:
