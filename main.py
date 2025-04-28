@@ -29,6 +29,7 @@ CHUNK = RATE // 20  # 50ms updates
 stop_event = threading.Event()
 transcription_thread = None
 
+
 class MicrophoneStream:
     """Opens a recording stream as a generator yielding audio chunks."""
     def __init__(self, rate: int = RATE, chunk: int = CHUNK, input_device_index: int = None) -> None:
@@ -93,19 +94,39 @@ def translate_text(texts: list[str], target_language: str = "en") -> list[str]:
     client = translate.TranslationServiceClient()
     project_id = "stttesting-445210"
     parent = f"projects/{project_id}/locations/global"
+
+    # Drop any empty or whitespace-only entries before calling the API
+    nonempty = [t for t in texts if t.strip()]
+    if not nonempty:
+        # Nothing to translate; return originals
+        return texts[:]
+
     response = client.translate_text(
         request={
-            "contents": texts,
+            "contents": nonempty,
             "target_language_code": target_language,
             "parent": parent,
         }
     )
-    return [html.unescape(translation.translated_text) for translation in response.translations]
+    translated = [html.unescape(tr.translated_text) for tr in response.translations]
+
+    # Rebuild the output list, replacing only the non-empty slots
+    out = []
+    ti = 0
+    for t in texts:
+        if t.strip():
+            out.append(translated[ti])
+            ti += 1
+        else:
+            out.append(t)
+    return out
+
 
 def log_translation(source: str, translation: str, filename: str = "translation_log.txt") -> None:
     """Append the original text and its translation to a log file."""
     with open(filename, "a", encoding="utf-8") as f:
         f.write(f"Source: {source}\nTranslation: {translation}\n\n")
+
 
 def listen_print_loop(responses, transcript_queue, target_language_code):
     # Throttle interval for translating interim results (in seconds)
@@ -113,7 +134,6 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
     last_translate_time = time.time() - TRANSLATION_INTERVAL
     last_translated_text = ""
     num_chars_printed = 0
-    exit_flag = False
 
     def sentence_finished(text):
         # Check if the text, once trimmed, ends with punctuation indicating sentence completion.
@@ -130,6 +150,9 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
             continue
 
         transcript = result.alternatives[0].transcript
+        # Skip completely empty transcripts
+        if not transcript.strip():
+            continue
 
         # Trigger immediate translation if the result is final or the sentence appears finished.
         if result.is_final or sentence_finished(transcript):
@@ -143,8 +166,7 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
 
             if re.search(r"\b(exit|quit)\b", transcript, re.I):
                 transcript_queue.put("Exiting..")
-                exit_flag = True
-                break
+                return True  # signal to exit
 
             num_chars_printed = 0
             last_translated_text = translated_text
@@ -169,7 +191,8 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
             transcript_queue.put(translated_text + overwrite_chars)
 
     transcript_queue.put(None)
-    return exit_flag
+    return False
+
 
 def run_transcription(transcript_queue, source_language_code, target_language_code, input_device_index):
     # Determine sample rate from the selected device, or use the default RATE.
@@ -201,28 +224,27 @@ def run_transcription(transcript_queue, source_language_code, target_language_co
         print("Restarting stream...")
 
         try:
-            try:
-                with MicrophoneStream(rate=sample_rate, chunk=chunk, input_device_index=input_device_index) as stream:
-                    audio_generator = stream.generator()
-                    requests = (speech.StreamingRecognizeRequest(audio_content=content)
-                                for content in audio_generator)
-                    should_exit = listen_print_loop(
-                        client.streaming_recognize(streaming_config, requests),
-                        transcript_queue,
-                        target_language_code
-                    )
-                    if should_exit:
-                        break
-            except OSError as audio_error:
-                print(f"[Audio Error] Could not open audio stream: {audio_error}")
-                time.sleep(2)
-                continue  # Retry the loop
-
+            with MicrophoneStream(rate=sample_rate, chunk=chunk, input_device_index=input_device_index) as stream:
+                audio_generator = stream.generator()
+                requests = (speech.StreamingRecognizeRequest(audio_content=content)
+                            for content in audio_generator)
+                should_exit = listen_print_loop(
+                    client.streaming_recognize(streaming_config, requests),
+                    transcript_queue,
+                    target_language_code
+                )
+                if should_exit:
+                    break
+        except OSError as audio_error:
+            print(f"[Audio Error] Could not open audio stream: {audio_error}")
+            time.sleep(2)
+            continue  # Retry the loop
         except Exception as e:
             if "Exceeded maximum allowed stream duration" in str(e):
                 continue
             else:
                 raise e
+
 
 def start_transcription_thread(source_language_code, target_language_code, input_device_index):
     global transcription_thread, transcript_queue
@@ -235,6 +257,7 @@ def start_transcription_thread(source_language_code, target_language_code, input
     transcription_thread.daemon = True
     transcription_thread.start()
 
+
 def stop_transcription_thread():
     global transcription_thread
     stop_event.set()
@@ -243,6 +266,7 @@ def stop_transcription_thread():
         if transcription_thread.is_alive():
             print("Warning: Transcription thread did not terminate in time.")
         transcription_thread = None
+
 
 def create_overlay(subtitle_color, chosen_stop_key):
     import tkinter as tk  # Still using Tkinter for the overlay
@@ -257,12 +281,12 @@ def create_overlay(subtitle_color, chosen_stop_key):
 
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
-    window_height = 200  # Increased height to accommodate longer text
+    window_height = 200
     x_pos = 0
     y_pos = screen_height - window_height - 50
     root.geometry(f"{screen_width}x{window_height}+{x_pos}+{y_pos}")
 
-    # Create a fixed-size label placed in the center.
+    # Left-aligned label
     subtitle_label = tk.Label(
         root,
         text="",
@@ -270,10 +294,16 @@ def create_overlay(subtitle_color, chosen_stop_key):
         fg=subtitle_color,
         bg="black",
         wraplength=screen_width - 100,
-        justify="center",
-        anchor="center"
+        justify="left",    # now left-aligned
+        anchor="w"         # text anchored to the west
     )
-    subtitle_label.place(relx=0.5, rely=0.5, anchor="center", width=screen_width-100, height=window_height)
+    subtitle_label.place(
+        relx=0.0,           # start at the left edge
+        rely=0.5,
+        anchor="w",
+        width=screen_width - 100,
+        height=window_height
+    )
 
     def poll_queue():
         try:
@@ -283,9 +313,9 @@ def create_overlay(subtitle_color, chosen_stop_key):
                     if root.winfo_exists():
                         root.quit()
                     return
-                # Only show one sentence: split on end-of-sentence punctuation and take the last segment.
+                # Split into sentences and take only one segment
                 segments = re.split(r'(?<=[\.!?])\s+', message.strip())
-                to_display = segments[-1] if segments else message
+                to_display = segments[-1] if segments else message  # one sentence max
                 subtitle_label.config(text=to_display)
         except queue.Empty:
             pass
@@ -298,9 +328,11 @@ def create_overlay(subtitle_color, chosen_stop_key):
     poll_queue()
     return root
 
+
 def global_stop_handler():
     print("Global hotkey triggered: Alt-F11. Exiting application.")
     os._exit(0)
+
 
 def show_settings():
     """
