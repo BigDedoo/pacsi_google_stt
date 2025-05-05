@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 import sys
 import os
+import re
 import queue
 import threading
 import logging
 import time
+import html
 
 import pyaudio
 import tkinter as tk
 import keyboard
-from PyQt5 import QtWidgets, QtGui, QtCore
+from PyQt5 import QtWidgets
 from google.cloud import speech, translate_v2 as translate
 from google.api_core.exceptions import GoogleAPIError
+
+# ----------------------------------------
+# HELPER: Extract only the last sentence
+# ----------------------------------------
+def extract_last_sentence(text: str) -> str:
+    """
+    Split on end-of-sentence punctuation (., !, ?) plus whitespace,
+    and return only the final segment. Falls back to the whole text.
+    """
+    segments = re.split(r'(?<=[.!?])\s+', text.strip())
+    return segments[-1] if segments else text
 
 # ----------------------------------------
 # CONFIGURATION
@@ -65,9 +78,7 @@ class SettingsDialog(QtWidgets.QDialog):
         color_layout.addWidget(QtWidgets.QLabel("Subtitle Color:"))
         self.color_preview = QtWidgets.QLabel()
         self.color_preview.setFixedSize(40, 20)
-        self.color_preview.setStyleSheet(
-            f"background-color: {self.subtitle_color}; border: 1px solid black;"
-        )
+        self.color_preview.setStyleSheet(f"background-color: {self.subtitle_color}; border: 1px solid black;")
         color_layout.addWidget(self.color_preview)
         self.color_button = QtWidgets.QPushButton("Choose Color")
         self.color_button.clicked.connect(self.choose_color)
@@ -102,7 +113,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.stop_key_edit.setReadOnly(True)
         layout.addWidget(self.stop_key_edit)
 
-        # OK / Cancel
+        # OK / Cancel buttons
         btn_layout = QtWidgets.QHBoxLayout()
         ok = QtWidgets.QPushButton("OK")
         ok.clicked.connect(self.accept)
@@ -116,14 +127,10 @@ class SettingsDialog(QtWidgets.QDialog):
         color = QtWidgets.QColorDialog.getColor(parent=self)
         if color.isValid():
             self.subtitle_color = color.name()
-            self.color_preview.setStyleSheet(
-                f"background-color: {self.subtitle_color}; border: 1px solid black;"
-            )
+            self.color_preview.setStyleSheet(f"background-color: {self.subtitle_color}; border: 1px solid black;")
 
     def get_settings(self):
-        direction = (
-            ("fr-BE", "en") if self.radio_fr_to_en.isChecked() else ("en-US", "fr-BE")
-        )
+        direction = ("fr-BE", "en") if self.radio_fr_to_en.isChecked() else ("en-US", "fr-BE")
         device = self.devices.get(self.input_device_combo.currentText(), None)
         return {
             "source_lang": direction[0],
@@ -147,21 +154,13 @@ class SubtitleOverlay(tk.Tk):
         except tk.TclError:
             pass
 
-        w = self.winfo_screenwidth()
-        h = self.winfo_screenheight()
+        w, h = self.winfo_screenwidth(), self.winfo_screenheight()
         win_h = 200
         self.geometry(f"{w}x{win_h}+0+{h - win_h - 50}")
 
-        self.label = tk.Label(
-            self,
-            text="",
-            font=("Helvetica", 28),
-            fg=subtitle_color,
-            bg="black",
-            wraplength=w - 100,
-            justify="left",
-            anchor="w",
-        )
+        self.label = tk.Label(self, text="", font=("Helvetica", 28),
+                              fg=subtitle_color, bg="black",
+                              wraplength=w - 100, justify="left", anchor="w")
         self.label.place(relx=0, rely=0.5, anchor="w", width=w - 100, height=win_h)
         self.after(poll_interval, self._poll_queue)
 
@@ -192,13 +191,9 @@ class MicrophoneStream:
         self.audio_interface = pyaudio.PyAudio()
         try:
             self.audio_stream = self.audio_interface.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.rate,
-                input=True,
-                input_device_index=self.device_index,
-                frames_per_buffer=self.chunk,
-                stream_callback=self._fill_buffer,
+                format=pyaudio.paInt16, channels=1, rate=self.rate,
+                input=True, input_device_index=self.device_index,
+                frames_per_buffer=self.chunk, stream_callback=self._fill_buffer
             )
         except Exception as e:
             logging.error("Failed to open audio stream: %s", e)
@@ -234,20 +229,17 @@ class MicrophoneStream:
             yield b"".join(data)
 
 # ----------------------------------------
-# TRANSCRIBER THREAD (with interim subtitles)
+# TRANSCRIBER THREAD (with interim + last-sentence)
 # ----------------------------------------
 class Transcriber(threading.Thread):
     def __init__(self, src_lang, tgt_lang, device_index):
         super().__init__(daemon=True)
-        self.src = src_lang
-        self.tgt = tgt_lang
-        self.device = device_index
+        self.src, self.tgt, self.device = src_lang, tgt_lang, device_index
         self.stop_event = threading.Event()
         self.speech_client = speech.SpeechClient()
         self.translate_client = translate.Client()
 
-        # For interim updates
-        self.translation_interval = 0.8  # seconds between interim translation calls
+        self.translation_interval = 0.8
         self.last_interim_time = time.time() - self.translation_interval
         self.last_interim_text = ""
 
@@ -258,17 +250,13 @@ class Transcriber(threading.Thread):
             language_code=self.src,
             enable_automatic_punctuation=True,
         )
-        streaming_cfg = speech.StreamingRecognitionConfig(
-            config=config, interim_results=True
-        )
+        streaming_cfg = speech.StreamingRecognitionConfig(config=config, interim_results=True)
         logging.info("Transcriber started.")
         try:
             with MicrophoneStream(RATE, CHUNK, self.device) as mic:
                 audio_gen = mic.generator()
-                requests = (
-                    speech.StreamingRecognizeRequest(audio_content=chunk)
-                    for chunk in audio_gen
-                )
+                requests = (speech.StreamingRecognizeRequest(audio_content=chunk)
+                            for chunk in audio_gen)
                 responses = self.speech_client.streaming_recognize(streaming_cfg, requests)
 
                 for resp in responses:
@@ -299,29 +287,27 @@ class Transcriber(threading.Thread):
         is_final = resp.results[0].is_final
 
         if is_final:
-            # Always translate final
-            out = self._translate_text(transcript)
-            logging.info("Final: %r → %r", transcript, out)
-            result_queue.put(out)
-            # Reset interim state
+            full = self._translate_text(transcript)
+            last = extract_last_sentence(full)
+            logging.info("Final: %r → %r", transcript, last)
+            result_queue.put(last)
             self.last_interim_time = now
             self.last_interim_text = ""
         else:
-            # Interim: throttle translation calls
             if now - self.last_interim_time >= self.translation_interval:
-                out = self._translate_text(transcript)
-                self.last_interim_text = out
+                full = self._translate_text(transcript)
+                last = extract_last_sentence(full)
+                self.last_interim_text = last
                 self.last_interim_time = now
-                logging.debug("Interim: %r → %r", transcript, out)
             else:
-                out = self.last_interim_text or transcript
-            # Push interim update
-            result_queue.put(out)
+                last = self.last_interim_text or extract_last_sentence(transcript)
+            result_queue.put(last)
 
     def _translate_text(self, text):
         try:
             res = self.translate_client.translate(text, target_language=self.tgt)
-            return res.get("translatedText", text)
+            raw = res.get("translatedText", text)
+            return html.unescape(raw)
         except GoogleAPIError as e:
             logging.error("Translation API error: %s", e)
             return text
@@ -348,7 +334,6 @@ def main():
             break
         cfg = dlg.get_settings()
 
-        # Unhook previous hotkeys, then register exit hotkey
         try:
             keyboard.unhook_all()
         except Exception:
@@ -356,17 +341,12 @@ def main():
         keyboard.add_hotkey(cfg["stop_key"], global_stop)
         logging.info("Registered global stop hotkey: %s", cfg["stop_key"])
 
-        # Start transcription thread
-        transcriber = Transcriber(
-            cfg["source_lang"], cfg["target_lang"], cfg["input_device_index"]
-        )
+        transcriber = Transcriber(cfg["source_lang"], cfg["target_lang"], cfg["input_device_index"])
         transcriber.start()
 
-        # Show the overlay until closed
         overlay = SubtitleOverlay(cfg["subtitle_color"])
         overlay.mainloop()
 
-        # On overlay close, stop transcription
         transcriber.stop()
         transcriber.join(timeout=2)
 
