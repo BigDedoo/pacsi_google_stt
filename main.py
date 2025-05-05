@@ -1,81 +1,225 @@
+#!/usr/bin/env python3
 import sys
 import os
-import time  # Added to allow a delay before restarting the audio stream
-import keyboard  # For global hotkeys
-import html
 import queue
-import re
 import threading
-from PyQt5 import QtWidgets, QtGui, QtCore  # Using PyQt for settings dialog
+import logging
+import time
+
 import pyaudio
-from google.cloud import speech, translate
+import tkinter as tk
+import keyboard
+from PyQt5 import QtWidgets, QtGui, QtCore
+from google.cloud import speech, translate_v2 as translate
+from google.api_core.exceptions import GoogleAPIError
 
-
-# If running as a bundled executable, set the credentials path to the extracted file.
+# ----------------------------------------
+# CONFIGURATION
+# ----------------------------------------
 if getattr(sys, 'frozen', False):
     base_path = sys._MEIPASS
 else:
     base_path = os.path.abspath(".")
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
+    base_path, "stttesting-445210-aa5e435ad2b1.json"
+)
 
-credentials_path = os.path.join(base_path, "stttesting-445210-aa5e435ad2b1.json")
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
+RATE = 48000
+CHUNK = RATE // 5  # 200 ms
 
+# ----------------------------------------
+# LOGGING SETUP
+# ----------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
-# Audio recording parameters
-RATE = 48000                  # Default sample rate: 48 kHz
-CHUNK = RATE // 5             # 200 ms chunks (48 000 Hz * 0.2 s = 9 600 samples)
+# ----------------------------------------
+# THREAD-SAFE QUEUE FOR SUBTITLES
+# ----------------------------------------
+result_queue = queue.Queue()
 
+# ----------------------------------------
+# SETTINGS DIALOG (PyQt5)
+# ----------------------------------------
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.resize(400, 300)
+        layout = QtWidgets.QVBoxLayout(self)
 
-# Global control event and transcription thread holder.
-stop_event = threading.Event()
-transcription_thread = None
+        # Translation Direction
+        layout.addWidget(QtWidgets.QLabel("Select Translation Direction:"))
+        self.radio_fr_to_en = QtWidgets.QRadioButton("French to English")
+        self.radio_en_to_fr = QtWidgets.QRadioButton("English to French")
+        self.radio_fr_to_en.setChecked(True)
+        layout.addWidget(self.radio_fr_to_en)
+        layout.addWidget(self.radio_en_to_fr)
 
+        # Subtitle Color
+        self.subtitle_color = "#FFFFFF"
+        color_layout = QtWidgets.QHBoxLayout()
+        color_layout.addWidget(QtWidgets.QLabel("Subtitle Color:"))
+        self.color_preview = QtWidgets.QLabel()
+        self.color_preview.setFixedSize(40, 20)
+        self.color_preview.setStyleSheet(
+            f"background-color: {self.subtitle_color}; border: 1px solid black;"
+        )
+        color_layout.addWidget(self.color_preview)
+        self.color_button = QtWidgets.QPushButton("Choose Color")
+        self.color_button.clicked.connect(self.choose_color)
+        color_layout.addWidget(self.color_button)
+        layout.addLayout(color_layout)
 
+        # Input Device Selection
+        layout.addWidget(QtWidgets.QLabel("Select Input Device:"))
+        self.input_device_combo = QtWidgets.QComboBox()
+        self.devices = {}
+        p = pyaudio.PyAudio()
+        try:
+            default_info = p.get_default_input_device_info()
+            default_name = default_info["name"]
+        except Exception:
+            default_name = None
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) > 0:
+                name = info["name"]
+                self.devices[name] = i
+                self.input_device_combo.addItem(name)
+                if name == default_name:
+                    self.input_device_combo.setCurrentText(name)
+        p.terminate()
+        layout.addWidget(self.input_device_combo)
+
+        # Stop Key (read-only)
+        layout.addWidget(QtWidgets.QLabel("Global Stop Key:"))
+        self.stop_key = "alt+f11"
+        self.stop_key_edit = QtWidgets.QLineEdit(self.stop_key)
+        self.stop_key_edit.setReadOnly(True)
+        layout.addWidget(self.stop_key_edit)
+
+        # OK / Cancel
+        btn_layout = QtWidgets.QHBoxLayout()
+        ok = QtWidgets.QPushButton("OK")
+        ok.clicked.connect(self.accept)
+        btn_layout.addWidget(ok)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel)
+        layout.addLayout(btn_layout)
+
+    def choose_color(self):
+        color = QtWidgets.QColorDialog.getColor(parent=self)
+        if color.isValid():
+            self.subtitle_color = color.name()
+            self.color_preview.setStyleSheet(
+                f"background-color: {self.subtitle_color}; border: 1px solid black;"
+            )
+
+    def get_settings(self):
+        direction = (
+            ("fr-BE", "en") if self.radio_fr_to_en.isChecked() else ("en-US", "fr-BE")
+        )
+        device = self.devices.get(self.input_device_combo.currentText(), None)
+        return {
+            "source_lang": direction[0],
+            "target_lang": direction[1],
+            "subtitle_color": self.subtitle_color,
+            "input_device_index": device,
+            "stop_key": self.stop_key,
+        }
+
+# ----------------------------------------
+# OVERLAY WINDOW (Tkinter)
+# ----------------------------------------
+class SubtitleOverlay(tk.Tk):
+    def __init__(self, subtitle_color, poll_interval=100):
+        super().__init__()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.config(bg="black")
+        try:
+            self.wm_attributes("-transparentcolor", "black")
+        except tk.TclError:
+            pass
+
+        w = self.winfo_screenwidth()
+        h = self.winfo_screenheight()
+        win_h = 200
+        self.geometry(f"{w}x{win_h}+0+{h - win_h - 50}")
+
+        self.label = tk.Label(
+            self,
+            text="",
+            font=("Helvetica", 28),
+            fg=subtitle_color,
+            bg="black",
+            wraplength=w - 100,
+            justify="left",
+            anchor="w",
+        )
+        self.label.place(relx=0, rely=0.5, anchor="w", width=w - 100, height=win_h)
+        self.after(poll_interval, self._poll_queue)
+
+    def _poll_queue(self):
+        try:
+            while True:
+                text = result_queue.get_nowait()
+                if text is None:
+                    self.destroy()
+                    return
+                self.label.config(text=text)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+# ----------------------------------------
+# MICROPHONE STREAM (PyAudio)
+# ----------------------------------------
 class MicrophoneStream:
-    """Opens a recording stream as a generator yielding audio chunks."""
-    def __init__(self, rate: int = RATE, chunk: int = CHUNK, input_device_index: int = None) -> None:
-        self._rate = rate
-        self._chunk = chunk
-        self.input_device_index = input_device_index
+    def __init__(self, rate, chunk, device_index=None):
+        self.rate = rate
+        self.chunk = chunk
+        self.device_index = device_index
         self._buff = queue.Queue()
         self.closed = True
 
-    def __enter__(self) -> "MicrophoneStream":
-        self._audio_interface = pyaudio.PyAudio()
-        self._audio_stream = self._audio_interface.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=self._rate,
-            input=True,
-            input_device_index=self.input_device_index,
-            frames_per_buffer=self._chunk,
-            stream_callback=self._fill_buffer,
-        )
+    def __enter__(self):
+        self.audio_interface = pyaudio.PyAudio()
+        try:
+            self.audio_stream = self.audio_interface.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self.rate,
+                input=True,
+                input_device_index=self.device_index,
+                frames_per_buffer=self.chunk,
+                stream_callback=self._fill_buffer,
+            )
+        except Exception as e:
+            logging.error("Failed to open audio stream: %s", e)
+            raise
         self.closed = False
         return self
 
-    def __exit__(self, type, value, traceback) -> None:
-        self._audio_stream.stop_stream()
-        self._audio_stream.close()
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.closed = True
-        # Unblock any pending queue operations.
+        self.audio_stream.stop_stream()
+        self.audio_stream.close()
+        self.audio_interface.terminate()
         self._buff.put(None)
-        self._audio_interface.terminate()
-        del self._audio_interface  # Ensure complete cleanup
 
-    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+    def _fill_buffer(self, in_data, frame_count, time_info, status):
         self._buff.put(in_data)
         return None, pyaudio.paContinue
 
     def generator(self):
-        # Use a timeout so that we periodically check the stop_event.
         while not self.closed:
-            try:
-                chunk = self._buff.get(timeout=0.5)
-            except queue.Empty:
-                if stop_event.is_set():
-                    return
-                continue
+            chunk = self._buff.get()
             if chunk is None:
                 return
             data = [chunk]
@@ -89,373 +233,144 @@ class MicrophoneStream:
                     break
             yield b"".join(data)
 
+# ----------------------------------------
+# TRANSCRIBER THREAD (with interim subtitles)
+# ----------------------------------------
+class Transcriber(threading.Thread):
+    def __init__(self, src_lang, tgt_lang, device_index):
+        super().__init__(daemon=True)
+        self.src = src_lang
+        self.tgt = tgt_lang
+        self.device = device_index
+        self.stop_event = threading.Event()
+        self.speech_client = speech.SpeechClient()
+        self.translate_client = translate.Client()
 
-def translate_text(texts: list[str], target_language: str = "en") -> list[str]:
-    """Batch translation to reduce API calls & latency."""
-    client = translate.TranslationServiceClient()
-    project_id = "stttesting-445210"
-    parent = f"projects/{project_id}/locations/global"
+        # For interim updates
+        self.translation_interval = 0.8  # seconds between interim translation calls
+        self.last_interim_time = time.time() - self.translation_interval
+        self.last_interim_text = ""
 
-    nonempty = [t for t in texts if t.strip()]
-    if not nonempty:
-        return texts[:]
-
-    response = client.translate_text(
-        request={
-            "contents": nonempty,
-            "target_language_code": target_language,
-            "parent": parent,
-        }
-    )
-    translated = [html.unescape(tr.translated_text) for tr in response.translations]
-
-    out = []
-    ti = 0
-    for t in texts:
-        if t.strip():
-            out.append(translated[ti])
-            ti += 1
-        else:
-            out.append(t)
-    return out
-
-
-def log_translation(source: str, translation: str, filename: str = "translation_log.txt") -> None:
-    """Append the original text and its translation to a log file."""
-    with open(filename, "a", encoding="utf-8") as f:
-        f.write(f"Source: {source}\nTranslation: {translation}\n\n")
-
-
-def listen_print_loop(responses, transcript_queue, target_language_code):
-    TRANSLATION_INTERVAL = 1.0
-    last_translate_time = time.time() - TRANSLATION_INTERVAL
-    last_translated_text = ""
-    num_chars_printed = 0
-
-    def sentence_finished(text):
-        text = text.strip()
-        return text.endswith('.') or text.endswith('!') or text.endswith('?')
-
-    for response in responses:
-        if stop_event.is_set():
-            break
-        if not response.results:
-            continue
-        result = response.results[0]
-        if not result.alternatives:
-            continue
-
-        transcript = result.alternatives[0].transcript
-        if not transcript.strip():
-            continue
-
-        if result.is_final or sentence_finished(transcript):
-            translations = translate_text([transcript], target_language=target_language_code)
-            translated_text = translations[0] if translations else transcript
-            log_translation(transcript, translated_text)
-            transcript_queue.put(translated_text)
-
-            if re.search(r"\b(exit|quit)\b", transcript, re.I):
-                transcript_queue.put("Exiting..")
-                return True
-
-            num_chars_printed = 0
-            last_translated_text = translated_text
-            last_translate_time = time.time()
-        else:
-            current_time = time.time()
-            if current_time - last_translate_time >= TRANSLATION_INTERVAL:
-                translations = translate_text([transcript], target_language=target_language_code)
-                translated_text = translations[0] if translations else transcript
-                last_translate_time = current_time
-                last_translated_text = translated_text
-                num_chars_printed = len(translated_text)
-            else:
-                translated_text = last_translated_text or transcript
-
-            overwrite_chars = (
-                " " * (num_chars_printed - len(translated_text))
-                if num_chars_printed > len(translated_text)
-                else ""
-            )
-            transcript_queue.put(translated_text + overwrite_chars)
-
-    transcript_queue.put(None)
-    return False
-
-
-def run_transcription(transcript_queue, source_language_code, target_language_code, input_device_index):
-    pya_instance = pyaudio.PyAudio()
-    if input_device_index is not None:
-        device_info = pya_instance.get_device_info_by_index(input_device_index)
-        sample_rate = int(device_info["defaultSampleRate"])
-    else:
-        sample_rate = RATE
-    pya_instance.terminate()
-
-    chunk = sample_rate // 5  # 200 ms at whatever sample rate we're using
-
-    client = speech.SpeechClient()
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=sample_rate,
-        language_code=source_language_code,
-        enable_automatic_punctuation=True,
-    )
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=config, interim_results=True, single_utterance=False
-    )
-
-    while True:
-        if stop_event.is_set():
-            break
-        print("Restarting stream...")
-
+    def run(self):
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code=self.src,
+            enable_automatic_punctuation=True,
+        )
+        streaming_cfg = speech.StreamingRecognitionConfig(
+            config=config, interim_results=True
+        )
+        logging.info("Transcriber started.")
         try:
-            with MicrophoneStream(rate=sample_rate, chunk=chunk, input_device_index=input_device_index) as stream:
-                audio_generator = stream.generator()
-                requests = (speech.StreamingRecognizeRequest(audio_content=content)
-                            for content in audio_generator)
-                should_exit = listen_print_loop(
-                    client.streaming_recognize(streaming_config, requests),
-                    transcript_queue,
-                    target_language_code
+            with MicrophoneStream(RATE, CHUNK, self.device) as mic:
+                audio_gen = mic.generator()
+                requests = (
+                    speech.StreamingRecognizeRequest(audio_content=chunk)
+                    for chunk in audio_gen
                 )
-                if should_exit:
-                    break
-        except OSError as audio_error:
-            print(f"[Audio Error] Could not open audio stream: {audio_error}")
-            time.sleep(2)
-            continue
-        except Exception as e:
-            if "Exceeded maximum allowed stream duration" in str(e):
-                continue
+                responses = self.speech_client.streaming_recognize(streaming_cfg, requests)
+
+                for resp in responses:
+                    if self.stop_event.is_set():
+                        logging.info("Stop event set; breaking.")
+                        break
+                    self._handle_response(resp)
+
+        except Exception:
+            logging.exception("Fatal error in Transcriber:")
+        finally:
+            result_queue.put(None)
+            logging.info("Transcriber exiting.")
+
+    def stop(self):
+        logging.info("Transcriber.stop() called.")
+        self.stop_event.set()
+
+    def _handle_response(self, resp):
+        if not resp.results or not resp.results[0].alternatives:
+            return
+        alt = resp.results[0].alternatives[0]
+        transcript = alt.transcript.strip()
+        if not transcript:
+            return
+
+        now = time.time()
+        is_final = resp.results[0].is_final
+
+        if is_final:
+            # Always translate final
+            out = self._translate_text(transcript)
+            logging.info("Final: %r → %r", transcript, out)
+            result_queue.put(out)
+            # Reset interim state
+            self.last_interim_time = now
+            self.last_interim_text = ""
+        else:
+            # Interim: throttle translation calls
+            if now - self.last_interim_time >= self.translation_interval:
+                out = self._translate_text(transcript)
+                self.last_interim_text = out
+                self.last_interim_time = now
+                logging.debug("Interim: %r → %r", transcript, out)
             else:
-                raise e
+                out = self.last_interim_text or transcript
+            # Push interim update
+            result_queue.put(out)
 
-
-def start_transcription_thread(source_language_code, target_language_code, input_device_index):
-    global transcription_thread, transcript_queue
-    transcript_queue = queue.Queue()
-    stop_event.clear()
-    transcription_thread = threading.Thread(
-        target=run_transcription,
-        args=(transcript_queue, source_language_code, target_language_code, input_device_index)
-    )
-    transcription_thread.daemon = True
-    transcription_thread.start()
-
-
-def stop_transcription_thread():
-    global transcription_thread
-    stop_event.set()
-    if transcription_thread is not None:
-        transcription_thread.join(timeout=2)
-        if transcription_thread.is_alive():
-            print("Warning: Transcription thread did not terminate in time.")
-        transcription_thread = None
-
-
-def create_overlay(subtitle_color, chosen_stop_key):
-    import tkinter as tk  # Still using Tkinter for the overlay
-    root = tk.Tk()
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    root.config(bg="black")
-    try:
-        root.wm_attributes("-transparentcolor", "black")
-    except tk.TclError:
-        pass
-
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    window_height = 200
-    x_pos = 0
-    y_pos = screen_height - window_height - 50
-    root.geometry(f"{screen_width}x{window_height}+{x_pos}+{y_pos}")
-
-    # Left-aligned label
-    subtitle_label = tk.Label(
-        root,
-        text="",
-        font=("Helvetica", 28),
-        fg=subtitle_color,
-        bg="black",
-        wraplength=screen_width - 100,
-        justify="left",    # now left-aligned
-        anchor="w"         # text anchored to the west
-    )
-    subtitle_label.place(
-        relx=0.0,           # start at the left edge
-        rely=0.5,
-        anchor="w",
-        width=screen_width - 100,
-        height=window_height
-    )
-
-    def poll_queue():
+    def _translate_text(self, text):
         try:
-            while True:
-                message = transcript_queue.get_nowait()
-                if message is None:
-                    if root.winfo_exists():
-                        root.quit()
-                    return
-                # Split into sentences and take only one segment
-                segments = re.split(r'(?<=[\.!?])\s+', message.strip())
-                to_display = segments[-1] if segments else message  # one sentence max
-                subtitle_label.config(text=to_display)
-        except queue.Empty:
-            pass
-        try:
-            if root.winfo_exists():
-                root.after(25, poll_queue)
-        except tk.TclError:
-            pass
+            res = self.translate_client.translate(text, target_language=self.tgt)
+            return res.get("translatedText", text)
+        except GoogleAPIError as e:
+            logging.error("Translation API error: %s", e)
+            return text
+        except Exception:
+            logging.exception("Unexpected translation error:")
+            return text
 
-    poll_queue()
-    return root
-
-
-def global_stop_handler():
-    print("Global hotkey triggered: Alt-F11. Exiting application.")
+# ----------------------------------------
+# GLOBAL STOP HANDLER
+# ----------------------------------------
+def global_stop():
+    logging.info("Global stop triggered. Exiting immediately.")
     os._exit(0)
 
-
-def show_settings():
-    """
-    Displays a PyQt-based settings dialog.
-    Returns:
-      (source_language_code, target_language_code, subtitle_color, input_device_index, chosen_stop_key)
-      or None if the dialog was cancelled.
-    """
-    # Create a QApplication if one does not exist.
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
-
-    class SettingsDialog(QtWidgets.QDialog):
-        def __init__(self, parent=None):
-            super(SettingsDialog, self).__init__(parent)
-            self.setWindowTitle("Settings")
-            self.setModal(True)
-            self.resize(400, 300)
-            layout = QtWidgets.QVBoxLayout()
-
-            # Translation Direction
-            layout.addWidget(QtWidgets.QLabel("Select Translation Direction:"))
-            self.radio_fr_to_en = QtWidgets.QRadioButton("French to English")
-            self.radio_en_to_fr = QtWidgets.QRadioButton("English to French")
-            self.radio_fr_to_en.setChecked(True)
-            layout.addWidget(self.radio_fr_to_en)
-            layout.addWidget(self.radio_en_to_fr)
-
-            # Subtitle Color with preview
-            self.subtitle_color = "white"
-            color_layout = QtWidgets.QHBoxLayout()
-            color_layout.addWidget(QtWidgets.QLabel("Subtitle Color:"))
-
-            # Add a color preview label
-            self.color_preview = QtWidgets.QLabel()
-            self.color_preview.setFixedSize(40, 20)
-            self.color_preview.setStyleSheet("background-color: white; border: 1px solid black;")
-            color_layout.addWidget(self.color_preview)
-
-            self.color_button = QtWidgets.QPushButton("Choose Color")
-            self.color_button.clicked.connect(self.choose_color)
-            color_layout.addWidget(self.color_button)
-            layout.addLayout(color_layout)
-
-            # Input Device Selection
-            layout.addWidget(QtWidgets.QLabel("Select Input Device:"))
-            self.input_device_combo = QtWidgets.QComboBox()
-            self.devices = {}
-            pya_instance = pyaudio.PyAudio()
-            default_device_name = None
-            try:
-                default_info = pya_instance.get_default_input_device_info()
-                default_device_name = default_info["name"]
-            except Exception:
-                pass
-
-            for i in range(pya_instance.get_device_count()):
-                info = pya_instance.get_device_info_by_index(i)
-                if info.get("maxInputChannels", 0) > 0:
-                    device_name = info["name"]
-                    self.devices[device_name] = info["index"]
-                    self.input_device_combo.addItem(device_name)
-            pya_instance.terminate()
-            layout.addWidget(self.input_device_combo)
-
-            # Stop Transcription Key (read-only)
-            layout.addWidget(QtWidgets.QLabel("Stop Transcription Key (e.g., Alt-F11):"))
-            self.stop_key = "Alt-F11"
-            self.stop_key_edit = QtWidgets.QLineEdit(self.stop_key)
-            self.stop_key_edit.setReadOnly(True)
-            layout.addWidget(self.stop_key_edit)
-
-            # OK Button
-            self.ok_button = QtWidgets.QPushButton("OK")
-            self.ok_button.clicked.connect(self.accept)
-            layout.addWidget(self.ok_button)
-
-            self.setLayout(layout)
-
-        def choose_color(self):
-            # Pass self as the parent to ensure the color dialog stays on top of the settings window.
-            color = QtWidgets.QColorDialog.getColor(parent=self)
-            if color.isValid():
-                self.subtitle_color = color.name()
-                self.color_preview.setStyleSheet(
-                    f"background-color: {self.subtitle_color}; border: 1px solid black;"
-                )
-
-    dialog = SettingsDialog()
-    dialog.setWindowFlags(dialog.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-    dialog.show()
-    dialog.raise_()
-    result = dialog.exec_()
-
-    if result == QtWidgets.QDialog.Accepted:
-        direction = "fr_to_en" if dialog.radio_fr_to_en.isChecked() else "en_to_fr"
-        subtitle_color = dialog.subtitle_color
-        selected_device_name = dialog.input_device_combo.currentText()
-        input_device_index = dialog.devices.get(selected_device_name, None)
-        chosen_stop_key = dialog.stop_key
-        if direction == "fr_to_en":
-            source_language_code = "fr-BE"
-            target_language_code = "en"
-        else:
-            source_language_code = "en-US"
-            target_language_code = "fr-BE"
-        return source_language_code, target_language_code, subtitle_color, input_device_index, chosen_stop_key
-    else:
-        return None
-
-
+# ----------------------------------------
+# MAIN LOOP
+# ----------------------------------------
 def main():
-    global overlay
-    overlay = None
-    # Register the global hotkey for Alt-F11.
-    keyboard.add_hotkey('alt+f11', global_stop_handler)
+    app = QtWidgets.QApplication(sys.argv)
 
-    # Main loop that cycles between settings and overlay.
     while True:
-        config = show_settings()
-        if not config:
+        dlg = SettingsDialog()
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
             break
-        source_language_code, target_language_code, subtitle_color, input_device_index, chosen_stop_key = config
+        cfg = dlg.get_settings()
 
-        # Start transcription.
-        start_transcription_thread(source_language_code, target_language_code, input_device_index)
+        # Unhook previous hotkeys, then register exit hotkey
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            logging.warning("Could not unhook previous hotkeys.")
+        keyboard.add_hotkey(cfg["stop_key"], global_stop)
+        logging.info("Registered global stop hotkey: %s", cfg["stop_key"])
 
-        # Create the overlay window.
-        overlay = create_overlay(subtitle_color, chosen_stop_key)
-        overlay.mainloop()  # Runs until the overlay is destroyed.
+        # Start transcription thread
+        transcriber = Transcriber(
+            cfg["source_lang"], cfg["target_lang"], cfg["input_device_index"]
+        )
+        transcriber.start()
 
-        stop_transcription_thread()
-        # Loop back to show settings again.
+        # Show the overlay until closed
+        overlay = SubtitleOverlay(cfg["subtitle_color"])
+        overlay.mainloop()
 
+        # On overlay close, stop transcription
+        transcriber.stop()
+        transcriber.join(timeout=2)
+
+    logging.info("Settings cancelled. Application exiting.")
 
 if __name__ == "__main__":
     main()
