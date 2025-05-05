@@ -22,8 +22,9 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
 
 
 # Audio recording parameters
-RATE = 16000
-CHUNK = RATE // 20  # 50ms updates
+RATE = 48000                  # Default sample rate: 48 kHz
+CHUNK = RATE // 5             # 200 ms chunks (48 000 Hz * 0.2 s = 9 600 samples)
+
 
 # Global control event and transcription thread holder.
 stop_event = threading.Event()
@@ -95,10 +96,8 @@ def translate_text(texts: list[str], target_language: str = "en") -> list[str]:
     project_id = "stttesting-445210"
     parent = f"projects/{project_id}/locations/global"
 
-    # Drop any empty or whitespace-only entries before calling the API
     nonempty = [t for t in texts if t.strip()]
     if not nonempty:
-        # Nothing to translate; return originals
         return texts[:]
 
     response = client.translate_text(
@@ -110,7 +109,6 @@ def translate_text(texts: list[str], target_language: str = "en") -> list[str]:
     )
     translated = [html.unescape(tr.translated_text) for tr in response.translations]
 
-    # Rebuild the output list, replacing only the non-empty slots
     out = []
     ti = 0
     for t in texts:
@@ -129,14 +127,12 @@ def log_translation(source: str, translation: str, filename: str = "translation_
 
 
 def listen_print_loop(responses, transcript_queue, target_language_code):
-    # Throttle interval for translating interim results (in seconds)
     TRANSLATION_INTERVAL = 1.0
     last_translate_time = time.time() - TRANSLATION_INTERVAL
     last_translated_text = ""
     num_chars_printed = 0
 
     def sentence_finished(text):
-        # Check if the text, once trimmed, ends with punctuation indicating sentence completion.
         text = text.strip()
         return text.endswith('.') or text.endswith('!') or text.endswith('?')
 
@@ -150,30 +146,24 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
             continue
 
         transcript = result.alternatives[0].transcript
-        # Skip completely empty transcripts
         if not transcript.strip():
             continue
 
-        # Trigger immediate translation if the result is final or the sentence appears finished.
         if result.is_final or sentence_finished(transcript):
             translations = translate_text([transcript], target_language=target_language_code)
             translated_text = translations[0] if translations else transcript
-
-            # Log the original transcript and its translation.
             log_translation(transcript, translated_text)
-
             transcript_queue.put(translated_text)
 
             if re.search(r"\b(exit|quit)\b", transcript, re.I):
                 transcript_queue.put("Exiting..")
-                return True  # signal to exit
+                return True
 
             num_chars_printed = 0
             last_translated_text = translated_text
             last_translate_time = time.time()
         else:
             current_time = time.time()
-            # Use throttled translation for interim updates that don't indicate sentence completion.
             if current_time - last_translate_time >= TRANSLATION_INTERVAL:
                 translations = translate_text([transcript], target_language=target_language_code)
                 translated_text = translations[0] if translations else transcript
@@ -181,7 +171,7 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
                 last_translated_text = translated_text
                 num_chars_printed = len(translated_text)
             else:
-                translated_text = last_translated_text if last_translated_text else transcript
+                translated_text = last_translated_text or transcript
 
             overwrite_chars = (
                 " " * (num_chars_printed - len(translated_text))
@@ -195,7 +185,6 @@ def listen_print_loop(responses, transcript_queue, target_language_code):
 
 
 def run_transcription(transcript_queue, source_language_code, target_language_code, input_device_index):
-    # Determine sample rate from the selected device, or use the default RATE.
     pya_instance = pyaudio.PyAudio()
     if input_device_index is not None:
         device_info = pya_instance.get_device_info_by_index(input_device_index)
@@ -204,7 +193,7 @@ def run_transcription(transcript_queue, source_language_code, target_language_co
         sample_rate = RATE
     pya_instance.terminate()
 
-    chunk = sample_rate // 20  # 50ms of audio
+    chunk = sample_rate // 5  # 200 ms at whatever sample rate we're using
 
     client = speech.SpeechClient()
     config = speech.RecognitionConfig(
@@ -217,7 +206,6 @@ def run_transcription(transcript_queue, source_language_code, target_language_co
         config=config, interim_results=True, single_utterance=False
     )
 
-    # Continuously restart the stream to avoid exceeding the 305-second limit.
     while True:
         if stop_event.is_set():
             break
@@ -238,7 +226,7 @@ def run_transcription(transcript_queue, source_language_code, target_language_co
         except OSError as audio_error:
             print(f"[Audio Error] Could not open audio stream: {audio_error}")
             time.sleep(2)
-            continue  # Retry the loop
+            continue
         except Exception as e:
             if "Exceeded maximum allowed stream duration" in str(e):
                 continue
