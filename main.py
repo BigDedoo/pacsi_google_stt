@@ -26,7 +26,8 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 )
 
 RATE = 48000
-CHUNK = RATE // 5  # 200 ms
+# read from mic every 100 ms (instead of 2 s)
+CHUNK = RATE // 10  # 100 ms
 
 # ----------------------------------------
 # LOGGING SETUP
@@ -52,6 +53,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.resize(400, 300)
         layout = QtWidgets.QVBoxLayout(self)
 
+        # Translation direction
         layout.addWidget(QtWidgets.QLabel("Select Translation Direction:"))
         self.radio_fr_to_en = QtWidgets.QRadioButton("French to English")
         self.radio_en_to_fr = QtWidgets.QRadioButton("English to French")
@@ -59,6 +61,7 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addWidget(self.radio_fr_to_en)
         layout.addWidget(self.radio_en_to_fr)
 
+        # Subtitle color
         self.subtitle_color = "#FFFFFF"
         color_layout = QtWidgets.QHBoxLayout()
         color_layout.addWidget(QtWidgets.QLabel("Subtitle Color:"))
@@ -71,6 +74,7 @@ class SettingsDialog(QtWidgets.QDialog):
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
 
+        # Input device selection
         layout.addWidget(QtWidgets.QLabel("Select Input Device:"))
         self.input_device_combo = QtWidgets.QComboBox()
         self.devices = {}
@@ -91,12 +95,14 @@ class SettingsDialog(QtWidgets.QDialog):
         p.terminate()
         layout.addWidget(self.input_device_combo)
 
+        # Global stop key display
         layout.addWidget(QtWidgets.QLabel("Global Stop Key:"))
         self.stop_key = "alt+f11"
         self.stop_key_edit = QtWidgets.QLineEdit(self.stop_key)
         self.stop_key_edit.setReadOnly(True)
         layout.addWidget(self.stop_key_edit)
 
+        # OK/Cancel buttons
         btn_layout = QtWidgets.QHBoxLayout()
         ok = QtWidgets.QPushButton("OK")
         ok.clicked.connect(self.accept)
@@ -127,7 +133,7 @@ class SettingsDialog(QtWidgets.QDialog):
 # OVERLAY WINDOW (Tkinter)
 # ----------------------------------------
 class SubtitleOverlay(tk.Tk):
-    def __init__(self, subtitle_color, poll_interval=100):
+    def __init__(self, subtitle_color, poll_interval=50):
         super().__init__()
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -138,22 +144,36 @@ class SubtitleOverlay(tk.Tk):
             pass
         w, h = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{w}x200+0+{h-250}")
-        self.label = tk.Label(self, text="", font=("Helvetica", 28), fg=subtitle_color, bg="black",
-                              wraplength=w-100, justify="left", anchor="w")
+        self.label = tk.Label(
+            self, text="", font=("Helvetica", 28),
+            fg=subtitle_color, bg="black",
+            wraplength=w-100, justify="left", anchor="w"
+        )
         self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=200)
-        self.after(poll_interval, self._poll_queue)
+        self.last_displayed = None
+
+        # store and use a tighter poll interval
+        self.poll_interval = poll_interval
+        self.after(self.poll_interval, self._poll_queue)
 
     def _poll_queue(self):
-        try:
-            text = result_queue.get_nowait()
-        except queue.Empty:
-            self.after(100, self._poll_queue)
-            return
-        if text is None:
-            self.destroy()
-            return
-        self.label.config(text=text)
-        self.after(3500, self._poll_queue)
+        latest = None
+        while True:
+            try:
+                txt = result_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if txt is None:
+                self.destroy()
+                return
+            latest = txt
+
+        if latest is not None and latest != self.last_displayed:
+            self.label.config(text=latest)
+            self.last_displayed = latest
+
+        self.after(self.poll_interval, self._poll_queue)
 
 # ----------------------------------------
 # MICROPHONE STREAM
@@ -163,6 +183,7 @@ class MicrophoneStream:
         self.rate, self.chunk, self.device = rate, chunk, device_index
         self._buff = queue.Queue()
         self.closed = True
+
     def __enter__(self):
         self.audio_interface = pyaudio.PyAudio()
         self.audio_stream = self.audio_interface.open(
@@ -171,70 +192,121 @@ class MicrophoneStream:
             frames_per_buffer=self.chunk, stream_callback=self._fill_buffer)
         self.closed = False
         return self
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.closed = True
-        self.audio_stream.stop_stream(); self.audio_stream.close(); self.audio_interface.terminate()
+        self.audio_stream.stop_stream()
+        self.audio_stream.close()
+        self.audio_interface.terminate()
         self._buff.put(None)
+
     def _fill_buffer(self, in_data, frame_count, time_info, status):
-        self._buff.put(in_data); return None, pyaudio.paContinue
+        self._buff.put(in_data)
+        return None, pyaudio.paContinue
+
     def generator(self):
         while not self.closed:
             chunk = self._buff.get()
-            if chunk is None: return
-            data=[chunk]
+            if chunk is None:
+                return
+            data = [chunk]
             while True:
-                try: c=self._buff.get(block=False)
-                except queue.Empty: break
-                if c is None: return
+                try:
+                    c = self._buff.get(block=False)
+                except queue.Empty:
+                    break
+                if c is None:
+                    return
                 data.append(c)
             yield b"".join(data)
 
 # ----------------------------------------
-# TRANSCRIBER THREAD
+# TRANSCRIBER THREAD WITH CONFIDENCE LOGGING
 # ----------------------------------------
 class Transcriber(threading.Thread):
     def __init__(self, src, tgt, device):
-        super().__init__(daemon=True); self.src, self.tgt, self.device = src, tgt, device
-        self.stop_event=threading.Event(); self.speech= speech.SpeechClient(); self.translate= translate.Client()
-    def run(self):
-        cfg= speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=RATE, language_code=self.src,
-            enable_automatic_punctuation=True,
-            model="phone_call",use_enhanced=True)
-        stream_cfg= speech.StreamingRecognitionConfig(config=cfg, interim_results=False)
-        with MicrophoneStream(RATE, CHUNK, self.device) as mic:
-            requests=(speech.StreamingRecognizeRequest(audio_content=chunk) for chunk in mic.generator())
-            for resp in self.speech.streaming_recognize(stream_cfg, requests):
-                if self.stop_event.is_set(): break
-                if not resp.results or not resp.results[0].alternatives: continue
-                text=resp.results[0].alternatives[0].transcript.strip()
-                full= self._translate(text)
-                # split into sentences
-                for sentence in [s.strip() for s in re.split(r'(?<=[.!?])\s+', full) if s.strip()]:
-                    logging.info("Sentence: %s", sentence)
-                    result_queue.put(sentence)
-        result_queue.put(None)
-    def stop(self): self.stop_event.set()
+        super().__init__(daemon=True)
+        self.src = src
+        self.tgt = tgt
+        self.device = device
+        self.stop_event = threading.Event()
+        self.speech = speech.SpeechClient()
+        self.translate = translate.Client()
+
     def _translate(self, txt):
-        try: res=self.translate.translate(txt, target_language=self.tgt); return html.unescape(res.get("translatedText", txt))
-        except Exception as e: logging.error("Translation error: %s", e); return txt
+        try:
+            res = self.translate.translate(txt, target_language=self.tgt)
+            return html.unescape(res.get("translatedText", txt))
+        except Exception as e:
+            logging.error("Translation error: %s", e)
+            return txt
+
+    def run(self):
+        cfg = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code=self.src,
+            enable_automatic_punctuation=True,
+            enable_word_confidence=True,
+            model="phone_call",
+            use_enhanced=True
+        )
+        stream_cfg = speech.StreamingRecognitionConfig(
+            config=cfg,
+            interim_results=True
+        )
+        with MicrophoneStream(RATE, CHUNK, self.device) as mic:
+            requests = (speech.StreamingRecognizeRequest(audio_content=chunk)
+                        for chunk in mic.generator())
+            for resp in self.speech.streaming_recognize(stream_cfg, requests):
+                if self.stop_event.is_set():
+                    break
+                if not resp.results or not resp.results[0].alternatives:
+                    continue
+                result = resp.results[0]
+                alt = result.alternatives[0]
+                text = alt.transcript.strip()
+                confidence = getattr(alt, 'confidence', None)
+                if not text:
+                    continue
+
+                # display interim & final translations immediately
+                translated = self._translate(text)
+                if result.is_final:
+                    logging.info("Final sentence: %s", translated)
+                else:
+                    logging.info("Interim result: %s", translated)
+                result_queue.put(translated)
+
+        result_queue.put(None)
+
+    def stop(self):
+        self.stop_event.set()
 
 # ----------------------------------------
 # GLOBAL STOP
 # ----------------------------------------
-def global_stop(): os._exit(0)
+def global_stop():
+    os._exit(0)
 
 # ----------------------------------------
 # MAIN
 # ----------------------------------------
 def main():
-    app=QtWidgets.QApplication(sys.argv)
+    app = QtWidgets.QApplication(sys.argv)
     while True:
-        dlg=SettingsDialog();
-        if dlg.exec_()!=QtWidgets.QDialog.Accepted: break
-        cfg=dlg.get_settings(); keyboard.unhook_all(); keyboard.add_hotkey(cfg["stop_key"], global_stop)
-        trans=Transcriber(cfg["source_lang"], cfg["target_lang"], cfg["input_device_index"])
-        trans.start(); SubtitleOverlay(cfg["subtitle_color"]).mainloop(); trans.stop(); trans.join()
+        dlg = SettingsDialog()
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            break
+        cfg = dlg.get_settings()
+        keyboard.unhook_all()
+        keyboard.add_hotkey(cfg["stop_key"], global_stop)
+        trans = Transcriber(cfg["source_lang"], cfg["target_lang"], cfg["input_device_index"])
+        trans.start()
+        # poll every 50 ms for maximum responsiveness
+        SubtitleOverlay(cfg["subtitle_color"], poll_interval=50).mainloop()
+        trans.stop()
+        trans.join()
 
-if __name__=="__main__": main()
+if __name__ == "__main__":
+    main()
