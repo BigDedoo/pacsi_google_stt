@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 import sys
 import os
-import re
 import queue
 import threading
 import logging
 import html
+import wave
+import argparse
 
 import pyaudio
 import tkinter as tk
 import keyboard
 from PyQt5 import QtWidgets
 from google.cloud import speech, translate_v2 as translate
-from google.api_core.exceptions import GoogleAPIError
 
 # ----------------------------------------
 # CONFIGURATION
@@ -26,8 +26,8 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 )
 
 RATE = 48000
-# read from mic every 100 ms (instead of 2 s)
-CHUNK = RATE // 10  # 100 ms
+CHUNK = RATE // 10           # 100 ms audio chunks
+DISPLAY_INTERVAL = 200        # default subtitle‐update interval in ms
 
 # ----------------------------------------
 # LOGGING SETUP
@@ -38,9 +38,36 @@ logging.basicConfig(
 )
 
 # ----------------------------------------
-# THREAD-SAFE QUEUE FOR SUBTITLES
+# THREAD‐SAFE QUEUE FOR SUBTITLES
 # ----------------------------------------
 result_queue = queue.Queue()
+
+# ----------------------------------------
+# FILE‐BASED “MIC” FOR DEV (WAV only)
+# ----------------------------------------
+class FileAudioStream:
+    def __init__(self, filename, rate, chunk):
+        self.filename = filename
+        self.rate = rate
+        self.chunk = chunk
+        self.wav = None
+
+    def __enter__(self):
+        self.wav = wave.open(self.filename, 'rb')
+        assert self.wav.getnchannels() == 1, "WAV must be mono"
+        assert self.wav.getsampwidth() == 2, "WAV must be 16‐bit"
+        assert self.wav.getframerate() == RATE, f"WAV sample rate must be {RATE}"
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.wav.close()
+
+    def generator(self):
+        while True:
+            data = self.wav.readframes(self.chunk)
+            if not data:
+                return
+            yield data
 
 # ----------------------------------------
 # SETTINGS DIALOG (PyQt5)
@@ -53,7 +80,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.resize(400, 300)
         layout = QtWidgets.QVBoxLayout(self)
 
-        # Translation direction
         layout.addWidget(QtWidgets.QLabel("Select Translation Direction:"))
         self.radio_fr_to_en = QtWidgets.QRadioButton("French to English")
         self.radio_en_to_fr = QtWidgets.QRadioButton("English to French")
@@ -61,20 +87,20 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addWidget(self.radio_fr_to_en)
         layout.addWidget(self.radio_en_to_fr)
 
-        # Subtitle color
         self.subtitle_color = "#FFFFFF"
         color_layout = QtWidgets.QHBoxLayout()
         color_layout.addWidget(QtWidgets.QLabel("Subtitle Color:"))
         self.color_preview = QtWidgets.QLabel()
         self.color_preview.setFixedSize(40, 20)
-        self.color_preview.setStyleSheet(f"background-color: {self.subtitle_color}; border: 1px solid black;")
+        self.color_preview.setStyleSheet(
+            f"background-color: {self.subtitle_color}; border: 1px solid black;"
+        )
         color_layout.addWidget(self.color_preview)
         self.color_button = QtWidgets.QPushButton("Choose Color")
         self.color_button.clicked.connect(self.choose_color)
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
 
-        # Input device selection
         layout.addWidget(QtWidgets.QLabel("Select Input Device:"))
         self.input_device_combo = QtWidgets.QComboBox()
         self.devices = {}
@@ -95,14 +121,12 @@ class SettingsDialog(QtWidgets.QDialog):
         p.terminate()
         layout.addWidget(self.input_device_combo)
 
-        # Global stop key display
         layout.addWidget(QtWidgets.QLabel("Global Stop Key:"))
         self.stop_key = "alt+f11"
         self.stop_key_edit = QtWidgets.QLineEdit(self.stop_key)
         self.stop_key_edit.setReadOnly(True)
         layout.addWidget(self.stop_key_edit)
 
-        # OK/Cancel buttons
         btn_layout = QtWidgets.QHBoxLayout()
         ok = QtWidgets.QPushButton("OK")
         ok.clicked.connect(self.accept)
@@ -116,7 +140,9 @@ class SettingsDialog(QtWidgets.QDialog):
         color = QtWidgets.QColorDialog.getColor(parent=self)
         if color.isValid():
             self.subtitle_color = color.name()
-            self.color_preview.setStyleSheet(f"background-color: {self.subtitle_color}; border: 1px solid black;")
+            self.color_preview.setStyleSheet(
+                f"background-color: {self.subtitle_color}; border: 1px solid black;"
+            )
 
     def get_settings(self):
         direction = ("fr-FR", "en") if self.radio_fr_to_en.isChecked() else ("en-US", "fr-FR")
@@ -133,7 +159,7 @@ class SettingsDialog(QtWidgets.QDialog):
 # OVERLAY WINDOW (Tkinter)
 # ----------------------------------------
 class SubtitleOverlay(tk.Tk):
-    def __init__(self, subtitle_color, poll_interval=50):
+    def __init__(self, subtitle_color, poll_interval):
         super().__init__()
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -151,8 +177,6 @@ class SubtitleOverlay(tk.Tk):
         )
         self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=200)
         self.last_displayed = None
-
-        # store and use a tighter poll interval
         self.poll_interval = poll_interval
         self.after(self.poll_interval, self._poll_queue)
 
@@ -163,7 +187,6 @@ class SubtitleOverlay(tk.Tk):
                 txt = result_queue.get_nowait()
             except queue.Empty:
                 break
-
             if txt is None:
                 self.destroy()
                 return
@@ -176,7 +199,7 @@ class SubtitleOverlay(tk.Tk):
         self.after(self.poll_interval, self._poll_queue)
 
 # ----------------------------------------
-# MICROPHONE STREAM
+# LIVE MIC STREAM
 # ----------------------------------------
 class MicrophoneStream:
     def __init__(self, rate, chunk, device_index=None):
@@ -221,14 +244,15 @@ class MicrophoneStream:
             yield b"".join(data)
 
 # ----------------------------------------
-# TRANSCRIBER THREAD WITH CONFIDENCE LOGGING
+# TRANSCRIBER THREAD
 # ----------------------------------------
 class Transcriber(threading.Thread):
-    def __init__(self, src, tgt, device):
+    def __init__(self, src, tgt, stream_cls, stream_arg):
         super().__init__(daemon=True)
         self.src = src
         self.tgt = tgt
-        self.device = device
+        self.stream_cls = stream_cls
+        self.stream_arg = stream_arg
         self.stop_event = threading.Event()
         self.speech = speech.SpeechClient()
         self.translate = translate.Client()
@@ -255,9 +279,11 @@ class Transcriber(threading.Thread):
             config=cfg,
             interim_results=True
         )
-        with MicrophoneStream(RATE, CHUNK, self.device) as mic:
-            requests = (speech.StreamingRecognizeRequest(audio_content=chunk)
-                        for chunk in mic.generator())
+        with self.stream_cls(self.stream_arg, RATE, CHUNK) as mic:
+            requests = (
+                speech.StreamingRecognizeRequest(audio_content=chunk)
+                for chunk in mic.generator()
+            )
             for resp in self.speech.streaming_recognize(stream_cfg, requests):
                 if self.stop_event.is_set():
                     break
@@ -266,16 +292,11 @@ class Transcriber(threading.Thread):
                 result = resp.results[0]
                 alt = result.alternatives[0]
                 text = alt.transcript.strip()
-                confidence = getattr(alt, 'confidence', None)
                 if not text:
                     continue
-
-                # display interim & final translations immediately
                 translated = self._translate(text)
-                if result.is_final:
-                    logging.info("Final sentence: %s", translated)
-                else:
-                    logging.info("Interim result: %s", translated)
+                tag = "Final" if result.is_final else "Interim"
+                logging.info(f"{tag}: {translated}")
                 result_queue.put(translated)
 
         result_queue.put(None)
@@ -293,6 +314,21 @@ def global_stop():
 # MAIN
 # ----------------------------------------
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dev-file", help="Path to a mono 16-bit 48 kHz WAV for dev mode")
+    parser.add_argument(
+        "--display-interval", type=int, default=DISPLAY_INTERVAL,
+        help="Time (ms) to wait between subtitle updates"
+    )
+    args = parser.parse_args()
+
+    if args.dev_file:
+        stream_cls = FileAudioStream
+        stream_arg = args.dev_file
+    else:
+        stream_cls = MicrophoneStream
+        stream_arg = None
+
     app = QtWidgets.QApplication(sys.argv)
     while True:
         dlg = SettingsDialog()
@@ -301,10 +337,15 @@ def main():
         cfg = dlg.get_settings()
         keyboard.unhook_all()
         keyboard.add_hotkey(cfg["stop_key"], global_stop)
-        trans = Transcriber(cfg["source_lang"], cfg["target_lang"], cfg["input_device_index"])
+
+        trans = Transcriber(
+            cfg["source_lang"],
+            cfg["target_lang"],
+            stream_cls,
+            stream_arg
+        )
         trans.start()
-        # poll every 50 ms for maximum responsiveness
-        SubtitleOverlay(cfg["subtitle_color"], poll_interval=50).mainloop()
+        SubtitleOverlay(cfg["subtitle_color"], poll_interval=args.display_interval).mainloop()
         trans.stop()
         trans.join()
 
