@@ -7,6 +7,8 @@ import logging
 import html
 import wave
 import argparse
+import collections
+import re
 
 import pyaudio
 import tkinter as tk
@@ -26,8 +28,8 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 )
 
 RATE = 48000
-CHUNK = RATE // 10           # 100 ms audio chunks
-DISPLAY_INTERVAL = 200        # default subtitle‐update interval in ms
+CHUNK = RATE           # 100 ms audio chunks
+DISPLAY_INTERVAL = 5000        # default subtitle‐update interval in ms
 
 # ----------------------------------------
 # LOGGING SETUP
@@ -256,6 +258,8 @@ class Transcriber(threading.Thread):
         self.stop_event = threading.Event()
         self.speech = speech.SpeechClient()
         self.translate = translate.Client()
+        # track how many times each interim sentence has appeared
+        self.interim_counts = collections.Counter()
 
     def _translate(self, txt):
         try:
@@ -295,6 +299,16 @@ class Transcriber(threading.Thread):
                 if not text:
                     continue
                 translated = self._translate(text)
+
+                # skip any interim sentence that ends in punctuation
+                # once seen 3 times
+                if not result.is_final:
+                    if re.search(r'[\.!?]$', translated):
+                        self.interim_counts[translated] += 1
+                        if self.interim_counts[translated] >= 3:
+                            logging.info(f"Skipping repeated interim sentence: {translated}")
+                            continue
+
                 tag = "Final" if result.is_final else "Interim"
                 logging.info(f"{tag}: {translated}")
                 result_queue.put(translated)
