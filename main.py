@@ -182,48 +182,34 @@ class SubtitleOverlay(tk.Tk):
         self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=200)
 
         self.poll_interval = poll_interval
-        self.hold_queue = []        # [(sentence, expire_time), ...]
-        self.removed = set()        # sentences already dropped
+        self.seen_sentences = []    # list of sentences we've already displayed
         self.after(self.poll_interval, self._poll_queue)
 
     def _poll_queue(self):
         latest = None
+        # Drain the queue to get the most recent interim/final transcript
         while True:
             try:
                 txt = result_queue.get_nowait()
             except queue.Empty:
                 break
-            if txt is None:
+            if txt is None:           # signal to terminate
                 self.destroy()
                 return
             latest = txt
 
-        now = time.time()
-        # remove expired holds
-        self.hold_queue = [(s, e) for (s, e) in self.hold_queue if e > now]
-
         if latest:
+            # Split on end-of-sentence punctuation
             parts = re.split(r'(?<=[.?!])\s+', latest)
-            if len(parts) > 1:
-                completed = " ".join(parts[:-1])
-                if completed not in self.removed and all(completed != s for s, _ in self.hold_queue):
-                    self.hold_queue.append((completed, now + 3))
+            # For each part, if we haven't shown it, show it now
+            new_to_show = [p for p in parts if p and p not in self.seen_sentences]
+            if new_to_show:
+                display_text = new_to_show[0]
+                # Mark it as seen so it never shows again
+                self.seen_sentences.append(display_text)
+                self.label.config(text=display_text)
 
-            if self.hold_queue:
-                display_text = self.hold_queue[0][0]
-            else:
-                raw = latest
-                for sent in self.removed:
-                    if raw.startswith(sent):
-                        raw = raw[len(sent):].lstrip()
-                display_text = raw
-
-            # mark expired sentences as removed
-            for s, exp in filter(lambda se: se[1] <= now, self.hold_queue):
-                self.removed.add(s)
-
-            self.label.config(text=display_text)
-
+        # Schedule next poll
         self.after(self.poll_interval, self._poll_queue)
 
 # ----------------------------------------
