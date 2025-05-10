@@ -7,6 +7,7 @@ import logging
 import html
 import wave
 import argparse
+import re
 
 import pyaudio
 import tkinter as tk
@@ -26,8 +27,8 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 )
 
 RATE = 48000
-CHUNK = RATE // 10           # 100 ms audio chunks
-DISPLAY_INTERVAL = 200        # default subtitle‐update interval in ms
+CHUNK = RATE // 2           # 100 ms audio chunks
+DISPLAY_INTERVAL = 100       # default subtitle‐update interval in ms
 
 # ----------------------------------------
 # LOGGING SETUP
@@ -176,7 +177,6 @@ class SubtitleOverlay(tk.Tk):
             wraplength=w-100, justify="left", anchor="w"
         )
         self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=200)
-        self.last_displayed = None
         self.poll_interval = poll_interval
         self.after(self.poll_interval, self._poll_queue)
 
@@ -192,9 +192,15 @@ class SubtitleOverlay(tk.Tk):
                 return
             latest = txt
 
-        if latest is not None and latest != self.last_displayed:
-            self.label.config(text=latest)
-            self.last_displayed = latest
+        if latest is not None:
+            # strip off any completed sentences
+            parts = re.split(r'(?<=[.?!])\s+', latest)
+            if len(parts) > 1:
+                display_text = parts[-1]
+            else:
+                display_text = latest
+
+            self.label.config(text=display_text)
 
         self.after(self.poll_interval, self._poll_queue)
 
@@ -304,15 +310,9 @@ class Transcriber(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
-# ----------------------------------------
-# GLOBAL STOP
-# ----------------------------------------
 def global_stop():
     os._exit(0)
 
-# ----------------------------------------
-# MAIN
-# ----------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dev-file", help="Path to a mono 16-bit 48 kHz WAV for dev mode")
