@@ -28,7 +28,7 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 
 RATE = 48000
 CHUNK = RATE // 2           # 100 ms audio chunks
-DISPLAY_INTERVAL = 100       # default subtitle‐update interval in ms
+DISPLAY_INTERVAL = 200       # default subtitle‐update interval in ms
 
 # ----------------------------------------
 # LOGGING SETUP
