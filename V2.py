@@ -154,7 +154,7 @@ def main(project_id: str) -> None:
             audio_channel_count=1,
         ),
         language_codes=["fr-FR"],
-        model="short",
+        model="long",
     )
     streaming_config = cloud_speech_types.StreamingRecognitionConfig(
         config=recognition_config,
