@@ -29,7 +29,7 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 
 RATE = 48000
 CHUNK = RATE // 10           # 100 ms audio chunks
-DISPLAY_INTERVAL = 3000       # default subtitle-update interval in ms
+DISPLAY_INTERVAL = 3000      # default subtitle-update interval in ms
 
 # ----------------------------------------
 # LOGGING SETUP
@@ -182,34 +182,29 @@ class SubtitleOverlay(tk.Tk):
         self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=200)
 
         self.poll_interval = poll_interval
-        self.seen_sentences = []    # list of sentences we've already displayed
+        self.seen_sentences = []
         self.after(self.poll_interval, self._poll_queue)
 
     def _poll_queue(self):
         latest = None
-        # Drain the queue to get the most recent interim/final transcript
         while True:
             try:
                 txt = result_queue.get_nowait()
             except queue.Empty:
                 break
-            if txt is None:           # signal to terminate
+            if txt is None:
                 self.destroy()
                 return
             latest = txt
 
         if latest:
-            # Split on end-of-sentence punctuation
             parts = re.split(r'(?<=[.?!])\s+', latest)
-            # For each part, if we haven't shown it, show it now
             new_to_show = [p for p in parts if p and p not in self.seen_sentences]
             if new_to_show:
                 display_text = new_to_show[0]
-                # Mark it as seen so it never shows again
                 self.seen_sentences.append(display_text)
                 self.label.config(text=display_text)
 
-        # Schedule next poll
         self.after(self.poll_interval, self._poll_queue)
 
 # ----------------------------------------
@@ -217,16 +212,22 @@ class SubtitleOverlay(tk.Tk):
 # ----------------------------------------
 class MicrophoneStream:
     def __init__(self, rate, chunk, device_index=None):
-        self.rate, self.chunk, self.device = rate, chunk, device_index
+        self.rate = rate
+        self.chunk = chunk
+        self.device = device_index
         self._buff = queue.Queue()
         self.closed = True
 
     def __enter__(self):
         self.audio_interface = pyaudio.PyAudio()
         self.audio_stream = self.audio_interface.open(
-            format=pyaudio.paInt16, channels=1, rate=self.rate,
-            input=True, input_device_index=self.device,
-            frames_per_buffer=self.chunk, stream_callback=self._fill_buffer
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self.rate,
+            input=True,
+            input_device_index=self.device,
+            frames_per_buffer=self.chunk,
+            stream_callback=self._fill_buffer
         )
         self.closed = False
         return self
@@ -294,7 +295,16 @@ class Transcriber(threading.Thread):
             config=cfg,
             interim_results=True
         )
-        with self.stream_cls(self.stream_arg, RATE, CHUNK) as mic:
+
+        # instantiate correct stream for file vs. mic
+        if isinstance(self.stream_arg, str):
+            # file mode
+            mic_ctx = self.stream_cls(self.stream_arg, RATE, CHUNK)
+        else:
+            # mic mode (stream_arg is device index or None)
+            mic_ctx = self.stream_cls(RATE, CHUNK, self.stream_arg)
+
+        with mic_ctx as mic:
             requests = (
                 speech.StreamingRecognizeRequest(audio_content=chunk)
                 for chunk in mic.generator()
@@ -327,12 +337,11 @@ def main():
     )
     args = parser.parse_args()
 
+    # determine stream class (file vs mic)
     if args.dev_file:
         stream_cls = FileAudioStream
-        stream_arg = args.dev_file
     else:
         stream_cls = MicrophoneStream
-        stream_arg = None
 
     app = QtWidgets.QApplication(sys.argv)
     while True:
@@ -340,8 +349,15 @@ def main():
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             break
         cfg = dlg.get_settings()
+
         keyboard.unhook_all()
         keyboard.add_hotkey(cfg["stop_key"], lambda: os._exit(0))
+
+        # pick the right argument: file path or mic device index
+        if args.dev_file:
+            stream_arg = args.dev_file
+        else:
+            stream_arg = cfg["input_device_index"]
 
         trans = Transcriber(cfg["source_lang"], cfg["target_lang"], stream_cls, stream_arg)
         trans.start()
