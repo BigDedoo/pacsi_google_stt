@@ -8,6 +8,7 @@ import html
 import wave
 import argparse
 import re
+import time
 
 import pyaudio
 import tkinter as tk
@@ -27,8 +28,8 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 )
 
 RATE = 48000
-CHUNK = RATE // 2           # 100 ms audio chunks
-DISPLAY_INTERVAL = 200       # default subtitle‐update interval in ms
+CHUNK = RATE // 10           # 100 ms audio chunks
+DISPLAY_INTERVAL = 3000       # default subtitle-update interval in ms
 
 # ----------------------------------------
 # LOGGING SETUP
@@ -39,12 +40,12 @@ logging.basicConfig(
 )
 
 # ----------------------------------------
-# THREAD‐SAFE QUEUE FOR SUBTITLES
+# THREAD-SAFE QUEUE FOR SUBTITLES
 # ----------------------------------------
 result_queue = queue.Queue()
 
 # ----------------------------------------
-# FILE‐BASED “MIC” FOR DEV (WAV only)
+# FILE-BASED “MIC” FOR DEV (WAV only)
 # ----------------------------------------
 class FileAudioStream:
     def __init__(self, filename, rate, chunk):
@@ -56,7 +57,7 @@ class FileAudioStream:
     def __enter__(self):
         self.wav = wave.open(self.filename, 'rb')
         assert self.wav.getnchannels() == 1, "WAV must be mono"
-        assert self.wav.getsampwidth() == 2, "WAV must be 16‐bit"
+        assert self.wav.getsampwidth() == 2, "WAV must be 16-bit"
         assert self.wav.getframerate() == RATE, f"WAV sample rate must be {RATE}"
         return self
 
@@ -169,15 +170,20 @@ class SubtitleOverlay(tk.Tk):
             self.wm_attributes("-transparentcolor", "black")
         except tk.TclError:
             pass
+
         w, h = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{w}x200+0+{h-250}")
+
         self.label = tk.Label(
             self, text="", font=("Helvetica", 28),
             fg=subtitle_color, bg="black",
             wraplength=w-100, justify="left", anchor="w"
         )
         self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=200)
+
         self.poll_interval = poll_interval
+        self.hold_queue = []        # [(sentence, expire_time), ...]
+        self.removed = set()        # sentences already dropped
         self.after(self.poll_interval, self._poll_queue)
 
     def _poll_queue(self):
@@ -192,13 +198,29 @@ class SubtitleOverlay(tk.Tk):
                 return
             latest = txt
 
-        if latest is not None:
-            # strip off any completed sentences
+        now = time.time()
+        # remove expired holds
+        self.hold_queue = [(s, e) for (s, e) in self.hold_queue if e > now]
+
+        if latest:
             parts = re.split(r'(?<=[.?!])\s+', latest)
             if len(parts) > 1:
-                display_text = parts[-1]
+                completed = " ".join(parts[:-1])
+                if completed not in self.removed and all(completed != s for s, _ in self.hold_queue):
+                    self.hold_queue.append((completed, now + 3))
+
+            if self.hold_queue:
+                display_text = self.hold_queue[0][0]
             else:
-                display_text = latest
+                raw = latest
+                for sent in self.removed:
+                    if raw.startswith(sent):
+                        raw = raw[len(sent):].lstrip()
+                display_text = raw
+
+            # mark expired sentences as removed
+            for s, exp in filter(lambda se: se[1] <= now, self.hold_queue):
+                self.removed.add(s)
 
             self.label.config(text=display_text)
 
@@ -218,7 +240,8 @@ class MicrophoneStream:
         self.audio_stream = self.audio_interface.open(
             format=pyaudio.paInt16, channels=1, rate=self.rate,
             input=True, input_device_index=self.device,
-            frames_per_buffer=self.chunk, stream_callback=self._fill_buffer)
+            frames_per_buffer=self.chunk, stream_callback=self._fill_buffer
+        )
         self.closed = False
         return self
 
@@ -295,13 +318,12 @@ class Transcriber(threading.Thread):
                     break
                 if not resp.results or not resp.results[0].alternatives:
                     continue
-                result = resp.results[0]
-                alt = result.alternatives[0]
+                alt = resp.results[0].alternatives[0]
                 text = alt.transcript.strip()
                 if not text:
                     continue
                 translated = self._translate(text)
-                tag = "Final" if result.is_final else "Interim"
+                tag = "Final" if resp.results[0].is_final else "Interim"
                 logging.info(f"{tag}: {translated}")
                 result_queue.put(translated)
 
@@ -310,15 +332,12 @@ class Transcriber(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
-def global_stop():
-    os._exit(0)
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dev-file", help="Path to a mono 16-bit 48 kHz WAV for dev mode")
     parser.add_argument(
         "--display-interval", type=int, default=DISPLAY_INTERVAL,
-        help="Time (ms) to wait between subtitle updates"
+        help="Time (ms) between subtitle updates"
     )
     args = parser.parse_args()
 
@@ -336,14 +355,9 @@ def main():
             break
         cfg = dlg.get_settings()
         keyboard.unhook_all()
-        keyboard.add_hotkey(cfg["stop_key"], global_stop)
+        keyboard.add_hotkey(cfg["stop_key"], lambda: os._exit(0))
 
-        trans = Transcriber(
-            cfg["source_lang"],
-            cfg["target_lang"],
-            stream_cls,
-            stream_arg
-        )
+        trans = Transcriber(cfg["source_lang"], cfg["target_lang"], stream_cls, stream_arg)
         trans.start()
         SubtitleOverlay(cfg["subtitle_color"], poll_interval=args.display_interval).mainloop()
         trans.stop()
