@@ -15,6 +15,7 @@ import tkinter as tk
 import keyboard
 from PyQt5 import QtWidgets
 from google.cloud import speech, translate_v2 as translate
+from google.api_core import exceptions
 
 # ----------------------------------------
 # CONFIGURATION
@@ -23,6 +24,30 @@ if getattr(sys, 'frozen', False):
     base_path = sys._MEIPASS
 else:
     base_path = os.path.abspath(".")
+# Ensure logs directory exists
+log_file = os.path.join(base_path, "app.log")
+
+# ----------------------------------------
+# LOGGING SETUP: write to both file and console
+# ----------------------------------------
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+file_handler.setFormatter(log_formatter)
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(log_formatter)
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[file_handler, stream_handler]
+)
+# Catch uncaught exceptions in main thread
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        # Call default handler for keyboard interrupts
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+sys.excepthook = handle_exception
+
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
     base_path, "stttesting-445210-aa5e435ad2b1.json"
 )
@@ -30,14 +55,6 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 RATE = 48000
 CHUNK = RATE // 2           # 100 ms audio chunks
 DISPLAY_INTERVAL = 2000     # subtitle-update interval in ms
-
-# ----------------------------------------
-# LOGGING SETUP
-# ----------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
 
 # ----------------------------------------
 # THREAD-SAFE QUEUE FOR SUBTITLES
@@ -65,7 +82,6 @@ class FileAudioStream:
         self.wav.close()
 
     def generator(self):
-        # how long each chunk represents, in seconds
         seconds_per_chunk = float(self.chunk) / self.rate
         while True:
             data = self.wav.readframes(self.chunk)
@@ -197,7 +213,6 @@ class SubtitleOverlay(tk.Tk):
                 raw = result_queue.get_nowait()
             except queue.Empty:
                 break
-            # simply drop any None markers instead of shutting down
             if raw is None:
                 continue
             latest = raw
@@ -215,6 +230,7 @@ class SubtitleOverlay(tk.Tk):
                         logging.error("Translation error: %s", e)
                         translated = sentence
                     self.label.config(text=translated)
+                    logging.info(f"Displayed subtitle: {translated}")
                     break
 
         self.after(self.poll_interval, self._poll_queue)
@@ -282,6 +298,7 @@ class Transcriber(threading.Thread):
         self.speech = speech.SpeechClient()
 
     def run(self):
+        """ Continuously open a streaming connection, restart on OutOfRange """
         cfg = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=RATE,
@@ -296,32 +313,47 @@ class Transcriber(threading.Thread):
             interim_results=True
         )
 
-        if isinstance(self.stream_arg, str):
-            mic_ctx = FileAudioStream(self.stream_arg, RATE, CHUNK)
-        else:
-            mic_ctx = MicrophoneStream(RATE, CHUNK, self.stream_arg)
+        while not self.stop_event.is_set():
+            try:
+                logging.info("Starting new speech stream")
+                if isinstance(self.stream_arg, str):
+                    mic_ctx = FileAudioStream(self.stream_arg, RATE, CHUNK)
+                else:
+                    mic_ctx = MicrophoneStream(RATE, CHUNK, self.stream_arg)
 
-        with mic_ctx as mic:
-            requests = (
-                speech.StreamingRecognizeRequest(audio_content=chunk)
-                for chunk in mic.generator()
-            )
-            for resp in self.speech.streaming_recognize(stream_cfg, requests):
-                if self.stop_event.is_set():
-                    break
-                if not resp.results or not resp.results[0].alternatives:
-                    continue
+                with mic_ctx as mic:
+                    requests = (
+                        speech.StreamingRecognizeRequest(audio_content=chunk)
+                        for chunk in mic.generator()
+                    )
+                    for resp in self.speech.streaming_recognize(stream_cfg, requests):
+                        if self.stop_event.is_set():
+                            break
+                        if not resp.results or not resp.results[0].alternatives:
+                            continue
 
-                text = resp.results[0].alternatives[0].transcript.strip()
-                if not text:
-                    continue
+                        text = resp.results[0].alternatives[0].transcript.strip()
+                        if not text:
+                            continue
 
-                prefix = "Final" if resp.results[0].is_final else "Interim"
-                logging.info(f"{prefix}: {text}")
-                result_queue.put(text)
+                        prefix = "Final" if resp.results[0].is_final else "Interim"
+                        logging.info(f"{prefix}: {text}")
+                        result_queue.put(text)
+
+                break
+
+            except exceptions.OutOfRange:
+                logging.warning("Stream duration exceeded; restarting stream")
+                time.sleep(0.5)
+                continue
+
+            except Exception as e:
+                logging.error("Unexpected error in Transcriber: %s", e)
+                break
 
     def stop(self):
         self.stop_event.set()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -342,7 +374,6 @@ def main():
             break
         cfg = dlg.get_settings()
 
-        # only way out is this hotkey
         keyboard.unhook_all()
         keyboard.add_hotkey(cfg["stop_key"], lambda: os._exit(0))
 
@@ -360,7 +391,6 @@ def main():
             target_lang=cfg["target_lang"]
         ).mainloop()
 
-        # we never join() until stop-key
         trans.stop()
         trans.join()
 
