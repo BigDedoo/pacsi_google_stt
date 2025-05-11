@@ -28,8 +28,8 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 )
 
 RATE = 48000
-CHUNK = RATE // 10           # 100 ms audio chunks
-DISPLAY_INTERVAL = 3000      # default subtitle-update interval in ms
+CHUNK = RATE // 2           # 100 ms audio chunks
+DISPLAY_INTERVAL = 2000     # subtitle-update interval in ms
 
 # ----------------------------------------
 # LOGGING SETUP
@@ -65,11 +65,14 @@ class FileAudioStream:
         self.wav.close()
 
     def generator(self):
+        # how long each chunk represents, in seconds
+        seconds_per_chunk = float(self.chunk) / self.rate
         while True:
             data = self.wav.readframes(self.chunk)
             if not data:
                 return
             yield data
+            time.sleep(seconds_per_chunk)
 
 # ----------------------------------------
 # SETTINGS DIALOG (PyQt5)
@@ -148,12 +151,11 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def get_settings(self):
         direction = ("fr-FR", "en") if self.radio_fr_to_en.isChecked() else ("en-US", "fr-FR")
-        device = self.devices.get(self.input_device_combo.currentText())
         return {
             "source_lang": direction[0],
             "target_lang": direction[1],
             "subtitle_color": self.subtitle_color,
-            "input_device_index": device,
+            "input_device_index": self.devices.get(self.input_device_combo.currentText()),
             "stop_key": self.stop_key,
         }
 
@@ -161,7 +163,7 @@ class SettingsDialog(QtWidgets.QDialog):
 # OVERLAY WINDOW (Tkinter)
 # ----------------------------------------
 class SubtitleOverlay(tk.Tk):
-    def __init__(self, subtitle_color, poll_interval):
+    def __init__(self, subtitle_color, poll_interval, target_lang):
         super().__init__()
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -183,27 +185,37 @@ class SubtitleOverlay(tk.Tk):
 
         self.poll_interval = poll_interval
         self.seen_sentences = []
+        self.translate_client = translate.Client()
+        self.target_lang = target_lang
+
         self.after(self.poll_interval, self._poll_queue)
 
     def _poll_queue(self):
         latest = None
         while True:
             try:
-                txt = result_queue.get_nowait()
+                raw = result_queue.get_nowait()
             except queue.Empty:
                 break
-            if txt is None:
-                self.destroy()
-                return
-            latest = txt
+            # simply drop any None markers instead of shutting down
+            if raw is None:
+                continue
+            latest = raw
 
         if latest:
             parts = re.split(r'(?<=[.?!])\s+', latest)
-            new_to_show = [p for p in parts if p and p not in self.seen_sentences]
-            if new_to_show:
-                display_text = new_to_show[0]
-                self.seen_sentences.append(display_text)
-                self.label.config(text=display_text)
+            for sentence in parts:
+                if sentence and sentence not in self.seen_sentences:
+                    self.seen_sentences.append(sentence)
+                    try:
+                        res = self.translate_client.translate(sentence,
+                                                              target_language=self.target_lang)
+                        translated = html.unescape(res.get("translatedText", sentence))
+                    except Exception as e:
+                        logging.error("Translation error: %s", e)
+                        translated = sentence
+                    self.label.config(text=translated)
+                    break
 
         self.after(self.poll_interval, self._poll_queue)
 
@@ -237,7 +249,6 @@ class MicrophoneStream:
         self.audio_stream.stop_stream()
         self.audio_stream.close()
         self.audio_interface.terminate()
-        self._buff.put(None)
 
     def _fill_buffer(self, in_data, frame_count, time_info, status):
         self._buff.put(in_data)
@@ -254,8 +265,6 @@ class MicrophoneStream:
                     c = self._buff.get(block=False)
                 except queue.Empty:
                     break
-                if c is None:
-                    return
                 data.append(c)
             yield b"".join(data)
 
@@ -271,15 +280,6 @@ class Transcriber(threading.Thread):
         self.stream_arg = stream_arg
         self.stop_event = threading.Event()
         self.speech = speech.SpeechClient()
-        self.translate = translate.Client()
-
-    def _translate(self, txt):
-        try:
-            res = self.translate.translate(txt, target_language=self.tgt)
-            return html.unescape(res.get("translatedText", txt))
-        except Exception as e:
-            logging.error("Translation error: %s", e)
-            return txt
 
     def run(self):
         cfg = speech.RecognitionConfig(
@@ -296,13 +296,10 @@ class Transcriber(threading.Thread):
             interim_results=True
         )
 
-        # instantiate correct stream for file vs. mic
         if isinstance(self.stream_arg, str):
-            # file mode
-            mic_ctx = self.stream_cls(self.stream_arg, RATE, CHUNK)
+            mic_ctx = FileAudioStream(self.stream_arg, RATE, CHUNK)
         else:
-            # mic mode (stream_arg is device index or None)
-            mic_ctx = self.stream_cls(RATE, CHUNK, self.stream_arg)
+            mic_ctx = MicrophoneStream(RATE, CHUNK, self.stream_arg)
 
         with mic_ctx as mic:
             requests = (
@@ -314,34 +311,29 @@ class Transcriber(threading.Thread):
                     break
                 if not resp.results or not resp.results[0].alternatives:
                     continue
-                alt = resp.results[0].alternatives[0]
-                text = alt.transcript.strip()
+
+                text = resp.results[0].alternatives[0].transcript.strip()
                 if not text:
                     continue
-                translated = self._translate(text)
-                tag = "Final" if resp.results[0].is_final else "Interim"
-                logging.info(f"{tag}: {translated}")
-                result_queue.put(translated)
 
-        result_queue.put(None)
+                prefix = "Final" if resp.results[0].is_final else "Interim"
+                logging.info(f"{prefix}: {text}")
+                result_queue.put(text)
 
     def stop(self):
         self.stop_event.set()
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dev-file", help="Path to a mono 16-bit 48 kHz WAV for dev mode")
+    parser.add_argument("--dev-file",
+                        help="Path to a mono 16-bit 48 kHz WAV for dev mode")
     parser.add_argument(
         "--display-interval", type=int, default=DISPLAY_INTERVAL,
         help="Time (ms) between subtitle updates"
     )
     args = parser.parse_args()
 
-    # determine stream class (file vs mic)
-    if args.dev_file:
-        stream_cls = FileAudioStream
-    else:
-        stream_cls = MicrophoneStream
+    stream_cls = FileAudioStream if args.dev_file else MicrophoneStream
 
     app = QtWidgets.QApplication(sys.argv)
     while True:
@@ -350,18 +342,25 @@ def main():
             break
         cfg = dlg.get_settings()
 
+        # only way out is this hotkey
         keyboard.unhook_all()
         keyboard.add_hotkey(cfg["stop_key"], lambda: os._exit(0))
 
-        # pick the right argument: file path or mic device index
-        if args.dev_file:
-            stream_arg = args.dev_file
-        else:
-            stream_arg = cfg["input_device_index"]
+        stream_arg = args.dev_file or cfg["input_device_index"]
 
-        trans = Transcriber(cfg["source_lang"], cfg["target_lang"], stream_cls, stream_arg)
+        trans = Transcriber(cfg["source_lang"],
+                            cfg["target_lang"],
+                            stream_cls,
+                            stream_arg)
         trans.start()
-        SubtitleOverlay(cfg["subtitle_color"], poll_interval=args.display_interval).mainloop()
+
+        SubtitleOverlay(
+            cfg["subtitle_color"],
+            poll_interval=args.display_interval,
+            target_lang=cfg["target_lang"]
+        ).mainloop()
+
+        # we never join() until stop-key
         trans.stop()
         trans.join()
 
