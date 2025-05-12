@@ -183,7 +183,9 @@ class SubtitleOverlay(tk.Tk):
             pass
 
         w, h = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{w}x200+0+{h-250}")
+        overlay_height = 140
+        y_position = h - overlay_height
+        self.geometry(f"{w}x{overlay_height}+10+{y_position}")
 
         self.label = tk.Label(
             self, text="", font=("Helvetica", 28),
@@ -227,8 +229,8 @@ class SubtitleOverlay(tk.Tk):
                 # wrap into lines
                 new_lines = textwrap.wrap(translated, width=110)
                 # display only this translation, scrolling if more than 3 lines
-                if len(new_lines) > 3:
-                    self.lines = new_lines[-3:]
+                if len(new_lines) > 2:
+                    self.lines = new_lines[-2:]
                 else:
                     self.lines = new_lines
 
@@ -340,19 +342,28 @@ class Transcriber(threading.Thread):
                             prefix = "Final" if resp.results[0].is_final else "Interim"
                             logging.info(f"{prefix}: {text}")
 
-                break
-
             except exceptions.OutOfRange:
                 logging.warning("Stream duration exceeded; restarting stream")
                 time.sleep(0.5)
-                continue
+                continue  # spin back up into the while, restarting the stream
 
             except Exception as e:
                 logging.error("Unexpected error in Transcriber: %s", e)
+                # if it's not something we know how to recover from, we could choose to break—
+                # but in most cases it’s better to log and retry:
+                time.sleep(0.5)
+                continue
+
+            # If you're in dev-file mode and only want to run the file once, you can exit here:
+            if isinstance(self.stream_arg, str):
+                logging.info("Dev-file mode complete; exiting Transcriber thread.")
                 break
+
+        logging.info("Transcriber thread stopping.")
 
     def stop(self):
         self.stop_event.set()
+
 
 
 def main():
