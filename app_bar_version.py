@@ -16,12 +16,10 @@ from ctypes import wintypes
 import pyaudio
 import tkinter as tk
 import keyboard
-import win32process
 from PyQt5 import QtWidgets
 from google.cloud import speech, translate_v2 as translate
 from google.api_core import exceptions
 
-# Windows-specific imports for window enumeration and resizing
 import win32gui
 import win32api
 import win32con
@@ -32,13 +30,13 @@ import win32con
 if getattr(sys, 'frozen', False):
     base_path = os.path.dirname(sys.executable)
 else:
-    base_path = os.path.abspath('.')
-log_file = os.path.join(base_path, 'app.log')
+    base_path = os.path.abspath(".")
+log_file = os.path.join(base_path, "app.log")
 
 # ----------------------------------------
 # LOGGING SETUP
 # ----------------------------------------
-log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
 file_handler.setFormatter(log_formatter)
 stream_handler = logging.StreamHandler()
@@ -49,17 +47,17 @@ def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    logging.error('Uncaught exception', exc_info=(exc_type, exc_value, exc_traceback))
+    logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
 sys.excepthook = handle_exception
 
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = os.path.join(
-    base_path, 'stttesting-445210-aa5e435ad2b1.json'
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
+    base_path, "stttesting-445210-aa5e435ad2b1.json"
 )
 
 RATE = 48000
 CHUNK = RATE // 2
 DISPLAY_INTERVAL = 3500
-SLIDE_HEIGHT = 140  # reserved bottom height
+SLIDE_HEIGHT = 140
 
 result_queue = queue.Queue()
 
@@ -75,9 +73,9 @@ class FileAudioStream:
 
     def __enter__(self):
         self.wav = wave.open(self.filename, 'rb')
-        assert self.wav.getnchannels() == 1, 'WAV must be mono'
-        assert self.wav.getsampwidth() == 2, 'WAV must be 16-bit'
-        assert self.wav.getframerate() == RATE, f'WAV sample rate must be {RATE}'
+        assert self.wav.getnchannels() == 1, "WAV must be mono"
+        assert self.wav.getsampwidth() == 2, "WAV must be 16-bit"
+        assert self.wav.getframerate() == RATE, f"WAV sample rate must be {RATE}"
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -93,53 +91,50 @@ class FileAudioStream:
             time.sleep(seconds_per_chunk)
 
 # ----------------------------------------
-# SETTINGS DIALOG (PyQt5) with Window Picker
+# SETTINGS DIALOG (PyQt5)
 # ----------------------------------------
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Settings')
+        self.setWindowTitle("Settings")
         self.setModal(True)
-        self.resize(400, 350)
+        self.resize(400, 250)
         layout = QtWidgets.QVBoxLayout(self)
 
-        # Translation direction
-        layout.addWidget(QtWidgets.QLabel('Select Translation Direction:'))
-        self.radio_fr_to_en = QtWidgets.QRadioButton('French to English')
-        self.radio_en_to_fr = QtWidgets.QRadioButton('English to French')
+        layout.addWidget(QtWidgets.QLabel("Select Translation Direction:"))
+        self.radio_fr_to_en = QtWidgets.QRadioButton("French to English")
+        self.radio_en_to_fr = QtWidgets.QRadioButton("English to French")
         self.radio_fr_to_en.setChecked(True)
         layout.addWidget(self.radio_fr_to_en)
         layout.addWidget(self.radio_en_to_fr)
 
-        # Subtitle color
-        self.subtitle_color = '#FFFFFF'
+        self.subtitle_color = "#FFFFFF"
         color_layout = QtWidgets.QHBoxLayout()
-        color_layout.addWidget(QtWidgets.QLabel('Subtitle Color:'))
+        color_layout.addWidget(QtWidgets.QLabel("Subtitle Color:"))
         self.color_preview = QtWidgets.QLabel()
         self.color_preview.setFixedSize(40, 20)
         self.color_preview.setStyleSheet(
-            f'background-color: {self.subtitle_color}; border: 1px solid black;'
+            f"background-color: {self.subtitle_color}; border: 1px solid black;"
         )
         color_layout.addWidget(self.color_preview)
-        self.color_button = QtWidgets.QPushButton('Choose Color')
+        self.color_button = QtWidgets.QPushButton("Choose Color")
         self.color_button.clicked.connect(self.choose_color)
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
 
-        # Input device
-        layout.addWidget(QtWidgets.QLabel('Select Input Device:'))
+        layout.addWidget(QtWidgets.QLabel("Select Input Device:"))
         self.input_device_combo = QtWidgets.QComboBox()
         self.devices = {}
         p = pyaudio.PyAudio()
         try:
             default_info = p.get_default_input_device_info()
-            default_name = default_info.get('name')
+            default_name = default_info.get("name")
         except Exception:
             default_name = None
         for i in range(p.get_device_count()):
             info = p.get_device_info_by_index(i)
-            if info.get('maxInputChannels', 0) > 0:
-                name = info['name']
+            if info.get("maxInputChannels", 0) > 0:
+                name = info["name"]
                 self.devices[name] = i
                 self.input_device_combo.addItem(name)
                 if name == default_name:
@@ -147,29 +142,17 @@ class SettingsDialog(QtWidgets.QDialog):
         p.terminate()
         layout.addWidget(self.input_device_combo)
 
-        # Global stop key
-        layout.addWidget(QtWidgets.QLabel('Global Stop Key:'))
-        self.stop_key = 'alt+f11'
+        layout.addWidget(QtWidgets.QLabel("Global Stop Key:"))
+        self.stop_key = "alt+f11"
         self.stop_key_edit = QtWidgets.QLineEdit(self.stop_key)
         self.stop_key_edit.setReadOnly(True)
         layout.addWidget(self.stop_key_edit)
 
-        # Slideshow window picker
-        layout.addWidget(QtWidgets.QLabel('Select Slideshow Window:'))
-        self.window_combo = QtWidgets.QComboBox()
-        self.window_map = {}
-        self._populate_windows()
-        layout.addWidget(self.window_combo)
-        refresh_btn = QtWidgets.QPushButton('Refresh List')
-        refresh_btn.clicked.connect(self._refresh_windows)
-        layout.addWidget(refresh_btn)
-
-        # OK / Cancel
         btn_layout = QtWidgets.QHBoxLayout()
-        ok = QtWidgets.QPushButton('OK')
+        ok = QtWidgets.QPushButton("OK")
         ok.clicked.connect(self.accept)
         btn_layout.addWidget(ok)
-        cancel = QtWidgets.QPushButton('Cancel')
+        cancel = QtWidgets.QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
         btn_layout.addWidget(cancel)
         layout.addLayout(btn_layout)
@@ -179,94 +162,48 @@ class SettingsDialog(QtWidgets.QDialog):
         if color.isValid():
             self.subtitle_color = color.name()
             self.color_preview.setStyleSheet(
-                f'background-color: {self.subtitle_color}; border: 1px solid black;'
+                f"background-color: {self.subtitle_color}; border: 1px solid black;"
             )
-
-    def _populate_windows(self):
-        self.window_combo.clear()
-        self.window_map.clear()
-
-        # 1) Collect all top‐level window handles into a list
-        window_list = []
-
-        def enum_cb(hwnd, extra):
-            window_list.append(hwnd)
-
-        win32gui.EnumWindows(enum_cb, None)
-
-        # 2) Iterate and add only visible ones, with rich metadata
-        for hwnd in window_list:
-            if not win32gui.IsWindowVisible(hwnd):
-                continue
-
-            # Title placeholder if empty
-            title = win32gui.GetWindowText(hwnd) or '<No Title>'
-            # Window class
-            cls = win32gui.GetClassName(hwnd)
-            # Process ID
-            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
-            # Geometry: left, top, right, bottom
-            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-            width, height = right - left, bottom - top
-
-            display = (
-                f"{hwnd:#010x} – {title} "
-                f"[class={cls} pid={pid} "
-                f"rect={width}×{height} @{left},{top}]"
-            )
-
-            self.window_map[display] = hwnd
-            self.window_combo.addItem(display)
-
-
-    def _refresh_windows(self):
-        self._populate_windows()
 
     def get_settings(self):
-        direction = ('fr-FR', 'en') if self.radio_fr_to_en.isChecked() else ('en-US', 'fr-FR')
-        selected = self.window_combo.currentText()
-        hwnd = self.window_map.get(selected)
+        direction = ("fr-FR", "en") if self.radio_fr_to_en.isChecked() else ("en-US", "fr-FR")
         return {
-            'source_lang': direction[0],
-            'target_lang': direction[1],
-            'subtitle_color': self.subtitle_color,
-            'input_device_index': self.devices.get(self.input_device_combo.currentText()),
-            'stop_key': self.stop_key,
-            'slideshow_hwnd': hwnd,
+            "source_lang": direction[0],
+            "target_lang": direction[1],
+            "subtitle_color": self.subtitle_color,
+            "input_device_index": self.devices.get(self.input_device_combo.currentText()),
+            "stop_key": self.stop_key,
         }
 
 # ----------------------------------------
-# OVERLAY WINDOW + AppBar + Slideshow Hook
+# OVERLAY WINDOW
 # ----------------------------------------
 class SubtitleOverlay(tk.Tk):
-    def __init__(self, subtitle_color, poll_interval, target_lang, slideshow_hwnd):
+    def __init__(self, subtitle_color, poll_interval, target_lang):
         super().__init__()
         self.overrideredirect(True)
-        self.attributes('-topmost', True)
-        self.config(bg='black')
+        self.attributes("-topmost", True)
+        self.config(bg="black")
         try:
-            self.wm_attributes('-transparentcolor', 'black')
+            self.wm_attributes("-transparentcolor", "black")
         except tk.TclError:
             pass
 
         w = self.winfo_screenwidth()
         h = self.winfo_screenheight()
-        y_pos = h - SLIDE_HEIGHT
-        self.geometry(f"{w}x{SLIDE_HEIGHT}+0+{y_pos}")
+        overlay_height = SLIDE_HEIGHT
+        y_pos = h - overlay_height
+        self.geometry(f"{w}x{overlay_height}+0+{y_pos}")
 
         self.label = tk.Label(
-            self, text='', font=('Helvetica', 28),
-            fg=subtitle_color, bg='black',
-            wraplength=w-100, justify='left', anchor='w'
+            self, text="", font=("Helvetica", 28),
+            fg=subtitle_color, bg="black",
+            wraplength=w-100, justify="left", anchor="w"
         )
-        self.label.place(relx=0, rely=0.5, anchor='w', width=w-100, height=SLIDE_HEIGHT)
+        self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=overlay_height)
 
-        # Register AppBar on Windows
-        self.after(0, lambda: self._register_appbar(self.winfo_id(), SLIDE_HEIGHT))
-        # Store selected slideshow handle
-        self.slideshow_hwnd = slideshow_hwnd
-        # Begin periodic hook
-        self.after(1000, self._hook_slideshow)
+        self.after(0, lambda: self._register_appbar(self.winfo_id(), overlay_height))
+        self._hook_fullscreen()
 
         self.poll_interval = poll_interval
         self.translate_client = translate.Client()
@@ -275,60 +212,55 @@ class SubtitleOverlay(tk.Tk):
         self.after(self.poll_interval, self._poll_queue)
 
     def _register_appbar(self, hwnd, height):
-        ABM_NEW      = 0x00000000
+        ABM_NEW = 0x00000000
         ABM_QUERYPOS = 0x00000002
-        ABM_SETPOS   = 0x00000003
-        ABE_BOTTOM   = 3
+        ABM_SETPOS = 0x00000003
+        ABE_BOTTOM = 3
 
         class APPBARDATA(ctypes.Structure):
             _fields_ = [
-                ('cbSize', wintypes.DWORD),
-                ('hWnd', wintypes.HWND),
-                ('uCallbackMessage', wintypes.UINT),
-                ('uEdge', wintypes.UINT),
-                ('rc', wintypes.RECT),
-                ('lParam', wintypes.LPARAM),
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uCallbackMessage", wintypes.UINT),
+                ("uEdge", wintypes.UINT),
+                ("rc", wintypes.RECT),
+                ("lParam", wintypes.LPARAM),
             ]
 
         abd = APPBARDATA()
         abd.cbSize = ctypes.sizeof(abd)
-        abd.hWnd   = hwnd
-        abd.uEdge  = ABE_BOTTOM
+        abd.hWnd = hwnd
+        abd.uEdge = ABE_BOTTOM
 
         ctypes.windll.shell32.SHAppBarMessage(ABM_NEW, ctypes.byref(abd))
 
         screen_w = ctypes.windll.user32.GetSystemMetrics(0)
         screen_h = ctypes.windll.user32.GetSystemMetrics(1)
-        abd.rc.left   = 0
-        abd.rc.right  = screen_w
-        abd.rc.top    = screen_h - height
+        abd.rc.left = 0
+        abd.rc.right = screen_w
+        abd.rc.top = screen_h - height
         abd.rc.bottom = screen_h
         ctypes.windll.shell32.SHAppBarMessage(ABM_QUERYPOS, ctypes.byref(abd))
         ctypes.windll.shell32.SHAppBarMessage(ABM_SETPOS, ctypes.byref(abd))
 
-        ctypes.windll.user32.SetWindowPos(
-            hwnd, -1,
-            abd.rc.left, abd.rc.top,
-            abd.rc.right - abd.rc.left,
-            abd.rc.bottom - abd.rc.top,
-            0x0004  # SWP_NOZORDER
-        )
-
-    def _hook_slideshow(self):
-        if self.slideshow_hwnd and win32gui.IsWindow(self.slideshow_hwnd):
-            # get monitor bounds
-            mi = win32api.MonitorFromWindow(self.slideshow_hwnd)
-            mon = win32api.GetMonitorInfo(mi)['Monitor']
-            left, top, right, bottom = mon
-            # shrink height by reserved strip
-            new_h = (bottom - top) - SLIDE_HEIGHT
-            win32gui.SetWindowPos(
-                self.slideshow_hwnd, None,
-                left, top,
-                right - left, new_h,
-                win32con.SWP_NOZORDER
-            )
-        self.after(1000, self._hook_slideshow)
+    def _hook_fullscreen(self):
+        """Every second, shrink any fullscreen window."""
+        def shrink_cb(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            rect = win32gui.GetWindowRect(hwnd)
+            mon = win32api.GetMonitorInfo(win32api.MonitorFromWindow(hwnd))["Monitor"]
+            if rect == mon:
+                left, top, right, bottom = mon
+                new_h = (bottom - top) - SLIDE_HEIGHT
+                win32gui.SetWindowPos(
+                    hwnd, None,
+                    left, top,
+                    right - left, new_h,
+                    win32con.SWP_NOZORDER
+                )
+        win32gui.EnumWindows(shrink_cb, None)
+        self.after(1000, self._hook_fullscreen)
 
     def _poll_queue(self):
         latest = None
@@ -346,19 +278,17 @@ class SubtitleOverlay(tk.Tk):
                 if not sentence:
                     continue
                 try:
-                    res = self.translate_client.translate(sentence,
-                                                          target_language=self.target_lang)
-                    translated = html.unescape(res.get('translatedText', sentence))
+                    res = self.translate_client.translate(sentence, target_language=self.target_lang)
+                    translated = html.unescape(res.get("translatedText", sentence))
                 except Exception:
                     translated = sentence
                 new_lines = textwrap.wrap(translated, width=110)
                 self.lines = new_lines[-2:] if len(new_lines) > 2 else new_lines
-                display_text = '\n'.join(self.lines)
-                self.label.config(text=display_text)
-                logging.info(f'Subtitle:\n{display_text}')
+                self.label.config(text="\n".join(self.lines))
                 break
 
         self.after(self.poll_interval, self._poll_queue)
+
 
 # ----------------------------------------
 # LIVE MIC STREAM
