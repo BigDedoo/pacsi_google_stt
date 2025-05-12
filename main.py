@@ -169,7 +169,7 @@ class SettingsDialog(QtWidgets.QDialog):
         }
 
 # ----------------------------------------
-# OVERLAY WINDOW (Tkinter) WITH ROLLING 2-LINE BUFFER
+# OVERLAY WINDOW (Tkinter) WITH ROLLING 3-LINE BUFFER
 # ----------------------------------------
 class SubtitleOverlay(tk.Tk):
     def __init__(self, subtitle_color, poll_interval, target_lang):
@@ -196,7 +196,6 @@ class SubtitleOverlay(tk.Tk):
         self.translate_client = translate.Client()
         self.target_lang = target_lang
 
-        # buffer to hold last two displayed lines
         self.lines = []
 
         self.after(self.poll_interval, self._poll_queue)
@@ -225,13 +224,13 @@ class SubtitleOverlay(tk.Tk):
                     logging.error("Translation error: %s", e)
                     translated = sentence
 
-                # wrap into lines (width increased by 10 chars)
+                # wrap into lines
                 new_lines = textwrap.wrap(translated, width=110)
-                self.lines.extend(new_lines)
-
-                # keep only the last two lines
-                if len(self.lines) > 2:
-                    self.lines = self.lines[-2:]
+                # display only this translation, scrolling if more than 3 lines
+                if len(new_lines) > 3:
+                    self.lines = new_lines[-3:]
+                else:
+                    self.lines = new_lines
 
                 display_text = "\n".join(self.lines)
                 self.label.config(text=display_text)
@@ -354,6 +353,7 @@ class Transcriber(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
+
 
 def main():
     parser = argparse.ArgumentParser()
