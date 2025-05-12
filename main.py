@@ -9,6 +9,7 @@ import wave
 import argparse
 import re
 import time
+import textwrap
 
 import pyaudio
 import tkinter as tk
@@ -24,25 +25,20 @@ if getattr(sys, 'frozen', False):
     base_path = sys._MEIPASS
 else:
     base_path = os.path.abspath(".")
-# Ensure logs directory exists
 log_file = os.path.join(base_path, "app.log")
 
 # ----------------------------------------
-# LOGGING SETUP: write to both file and console
+# LOGGING SETUP
 # ----------------------------------------
 log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
 file_handler.setFormatter(log_formatter)
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(log_formatter)
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[file_handler, stream_handler]
-)
-# Catch uncaught exceptions in main thread
+logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
+
 def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
-        # Call default handler for keyboard interrupts
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
     logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
@@ -53,12 +49,9 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
 )
 
 RATE = 48000
-CHUNK = RATE // 2           # 100 ms audio chunks
-DISPLAY_INTERVAL = 2000     # subtitle-update interval in ms
+CHUNK = RATE // 2
+DISPLAY_INTERVAL = 3500
 
-# ----------------------------------------
-# THREAD-SAFE QUEUE FOR SUBTITLES
-# ----------------------------------------
 result_queue = queue.Queue()
 
 # ----------------------------------------
@@ -176,7 +169,7 @@ class SettingsDialog(QtWidgets.QDialog):
         }
 
 # ----------------------------------------
-# OVERLAY WINDOW (Tkinter)
+# OVERLAY WINDOW (Tkinter) WITH ROLLING 2-LINE BUFFER
 # ----------------------------------------
 class SubtitleOverlay(tk.Tk):
     def __init__(self, subtitle_color, poll_interval, target_lang):
@@ -200,9 +193,11 @@ class SubtitleOverlay(tk.Tk):
         self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=200)
 
         self.poll_interval = poll_interval
-        self.seen_sentences = []
         self.translate_client = translate.Client()
         self.target_lang = target_lang
+
+        # buffer to hold last two displayed lines
+        self.lines = []
 
         self.after(self.poll_interval, self._poll_queue)
 
@@ -220,18 +215,28 @@ class SubtitleOverlay(tk.Tk):
         if latest:
             parts = re.split(r'(?<=[.?!])\s+', latest)
             for sentence in parts:
-                if sentence and sentence not in self.seen_sentences:
-                    self.seen_sentences.append(sentence)
-                    try:
-                        res = self.translate_client.translate(sentence,
-                                                              target_language=self.target_lang)
-                        translated = html.unescape(res.get("translatedText", sentence))
-                    except Exception as e:
-                        logging.error("Translation error: %s", e)
-                        translated = sentence
-                    self.label.config(text=translated)
-                    logging.info(f"Displayed subtitle: {translated}")
-                    break
+                if not sentence:
+                    continue
+                try:
+                    res = self.translate_client.translate(sentence,
+                                                          target_language=self.target_lang)
+                    translated = html.unescape(res.get("translatedText", sentence))
+                except Exception as e:
+                    logging.error("Translation error: %s", e)
+                    translated = sentence
+
+                # wrap into lines (width increased by 10 chars)
+                new_lines = textwrap.wrap(translated, width=110)
+                self.lines.extend(new_lines)
+
+                # keep only the last two lines
+                if len(self.lines) > 2:
+                    self.lines = self.lines[-2:]
+
+                display_text = "\n".join(self.lines)
+                self.label.config(text=display_text)
+                logging.info(f"Displayed subtitle buffer:\n{display_text}")
+                break
 
         self.after(self.poll_interval, self._poll_queue)
 
@@ -298,7 +303,6 @@ class Transcriber(threading.Thread):
         self.speech = speech.SpeechClient()
 
     def run(self):
-        """ Continuously open a streaming connection, restart on OutOfRange """
         cfg = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=RATE,
@@ -316,10 +320,9 @@ class Transcriber(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 logging.info("Starting new speech stream")
-                if isinstance(self.stream_arg, str):
-                    mic_ctx = FileAudioStream(self.stream_arg, RATE, CHUNK)
-                else:
-                    mic_ctx = MicrophoneStream(RATE, CHUNK, self.stream_arg)
+                mic_ctx = (FileAudioStream(self.stream_arg, RATE, CHUNK)
+                           if isinstance(self.stream_arg, str)
+                           else MicrophoneStream(RATE, CHUNK, self.stream_arg))
 
                 with mic_ctx as mic:
                     requests = (
@@ -333,12 +336,10 @@ class Transcriber(threading.Thread):
                             continue
 
                         text = resp.results[0].alternatives[0].transcript.strip()
-                        if not text:
-                            continue
-
-                        prefix = "Final" if resp.results[0].is_final else "Interim"
-                        logging.info(f"{prefix}: {text}")
-                        result_queue.put(text)
+                        if text:
+                            result_queue.put(text)
+                            prefix = "Final" if resp.results[0].is_final else "Interim"
+                            logging.info(f"{prefix}: {text}")
 
                 break
 
@@ -353,7 +354,6 @@ class Transcriber(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
-
 
 def main():
     parser = argparse.ArgumentParser()
