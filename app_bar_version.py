@@ -30,13 +30,13 @@ import win32con
 if getattr(sys, 'frozen', False):
     base_path = os.path.dirname(sys.executable)
 else:
-    base_path = os.path.abspath(".")
-log_file = os.path.join(base_path, "app.log")
+    base_path = os.path.abspath('.')
+log_file = os.path.join(base_path, 'app.log')
 
 # ----------------------------------------
 # LOGGING SETUP
 # ----------------------------------------
-log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
 file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
 file_handler.setFormatter(log_formatter)
 stream_handler = logging.StreamHandler()
@@ -47,16 +47,16 @@ def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    logging.error('Uncaught exception', exc_info=(exc_type, exc_value, exc_traceback))
 sys.excepthook = handle_exception
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
-    base_path, "stttesting-445210-aa5e435ad2b1.json"
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = os.path.join(
+    base_path, 'stttesting-445210-aa5e435ad2b1.json'
 )
 
 RATE = 48000
-CHUNK = RATE // 2
-DISPLAY_INTERVAL = 3500
+DISPLAY_INTERVAL = 1500
+CHUNK = int(RATE * (DISPLAY_INTERVAL / 1000.0))
 SLIDE_HEIGHT = 140
 
 result_queue = queue.Queue()
@@ -73,9 +73,9 @@ class FileAudioStream:
 
     def __enter__(self):
         self.wav = wave.open(self.filename, 'rb')
-        assert self.wav.getnchannels() == 1, "WAV must be mono"
-        assert self.wav.getsampwidth() == 2, "WAV must be 16-bit"
-        assert self.wav.getframerate() == RATE, f"WAV sample rate must be {RATE}"
+        assert self.wav.getnchannels() == 1, 'WAV must be mono'
+        assert self.wav.getsampwidth() == 2, 'WAV must be 16-bit'
+        assert self.wav.getframerate() == RATE, f'WAV sample rate must be {RATE}'
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -96,45 +96,45 @@ class FileAudioStream:
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Settings")
+        self.setWindowTitle('Settings')
         self.setModal(True)
         self.resize(400, 250)
         layout = QtWidgets.QVBoxLayout(self)
 
-        layout.addWidget(QtWidgets.QLabel("Select Translation Direction:"))
-        self.radio_fr_to_en = QtWidgets.QRadioButton("French to English")
-        self.radio_en_to_fr = QtWidgets.QRadioButton("English to French")
+        layout.addWidget(QtWidgets.QLabel('Select Translation Direction:'))
+        self.radio_fr_to_en = QtWidgets.QRadioButton('French to English')
+        self.radio_en_to_fr = QtWidgets.QRadioButton('English to French')
         self.radio_fr_to_en.setChecked(True)
         layout.addWidget(self.radio_fr_to_en)
         layout.addWidget(self.radio_en_to_fr)
 
-        self.subtitle_color = "#FFFFFF"
+        self.subtitle_color = '#FFFFFF'
         color_layout = QtWidgets.QHBoxLayout()
-        color_layout.addWidget(QtWidgets.QLabel("Subtitle Color:"))
+        color_layout.addWidget(QtWidgets.QLabel('Subtitle Color:'))
         self.color_preview = QtWidgets.QLabel()
         self.color_preview.setFixedSize(40, 20)
         self.color_preview.setStyleSheet(
-            f"background-color: {self.subtitle_color}; border: 1px solid black;"
+            f'background-color: {self.subtitle_color}; border: 1px solid black;'
         )
         color_layout.addWidget(self.color_preview)
-        self.color_button = QtWidgets.QPushButton("Choose Color")
+        self.color_button = QtWidgets.QPushButton('Choose Color')
         self.color_button.clicked.connect(self.choose_color)
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
 
-        layout.addWidget(QtWidgets.QLabel("Select Input Device:"))
+        layout.addWidget(QtWidgets.QLabel('Select Input Device:'))
         self.input_device_combo = QtWidgets.QComboBox()
         self.devices = {}
         p = pyaudio.PyAudio()
         try:
             default_info = p.get_default_input_device_info()
-            default_name = default_info.get("name")
+            default_name = default_info.get('name')
         except Exception:
             default_name = None
         for i in range(p.get_device_count()):
             info = p.get_device_info_by_index(i)
-            if info.get("maxInputChannels", 0) > 0:
-                name = info["name"]
+            if info.get('maxInputChannels', 0) > 0:
+                name = info['name']
                 self.devices[name] = i
                 self.input_device_combo.addItem(name)
                 if name == default_name:
@@ -142,17 +142,17 @@ class SettingsDialog(QtWidgets.QDialog):
         p.terminate()
         layout.addWidget(self.input_device_combo)
 
-        layout.addWidget(QtWidgets.QLabel("Global Stop Key:"))
-        self.stop_key = "alt+f11"
+        layout.addWidget(QtWidgets.QLabel('Global Stop Key:'))
+        self.stop_key = 'alt+f11'
         self.stop_key_edit = QtWidgets.QLineEdit(self.stop_key)
         self.stop_key_edit.setReadOnly(True)
         layout.addWidget(self.stop_key_edit)
 
         btn_layout = QtWidgets.QHBoxLayout()
-        ok = QtWidgets.QPushButton("OK")
+        ok = QtWidgets.QPushButton('OK')
         ok.clicked.connect(self.accept)
         btn_layout.addWidget(ok)
-        cancel = QtWidgets.QPushButton("Cancel")
+        cancel = QtWidgets.QPushButton('Cancel')
         cancel.clicked.connect(self.reject)
         btn_layout.addWidget(cancel)
         layout.addLayout(btn_layout)
@@ -162,30 +162,30 @@ class SettingsDialog(QtWidgets.QDialog):
         if color.isValid():
             self.subtitle_color = color.name()
             self.color_preview.setStyleSheet(
-                f"background-color: {self.subtitle_color}; border: 1px solid black;"
+                f'background-color: {self.subtitle_color}; border: 1px solid black;'
             )
 
     def get_settings(self):
-        direction = ("fr-FR", "en") if self.radio_fr_to_en.isChecked() else ("en-US", "fr-FR")
+        direction = ('fr-FR', 'en') if self.radio_fr_to_en.isChecked() else ('en-US', 'fr-FR')
         return {
-            "source_lang": direction[0],
-            "target_lang": direction[1],
-            "subtitle_color": self.subtitle_color,
-            "input_device_index": self.devices.get(self.input_device_combo.currentText()),
-            "stop_key": self.stop_key,
+            'source_lang': direction[0],
+            'target_lang': direction[1],
+            'subtitle_color': self.subtitle_color,
+            'input_device_index': self.devices.get(self.input_device_combo.currentText()),
+            'stop_key': self.stop_key,
         }
 
 # ----------------------------------------
-# OVERLAY WINDOW
+# OVERLAY WINDOW with AppBar + Delta Translation
 # ----------------------------------------
 class SubtitleOverlay(tk.Tk):
     def __init__(self, subtitle_color, poll_interval, target_lang):
         super().__init__()
         self.overrideredirect(True)
-        self.attributes("-topmost", True)
-        self.config(bg="black")
+        self.attributes('-topmost', True)
+        self.config(bg='black')
         try:
-            self.wm_attributes("-transparentcolor", "black")
+            self.wm_attributes('-transparentcolor', 'black')
         except tk.TclError:
             pass
 
@@ -193,22 +193,23 @@ class SubtitleOverlay(tk.Tk):
         h = self.winfo_screenheight()
         overlay_height = SLIDE_HEIGHT
         y_pos = h - overlay_height
-        self.geometry(f"{w}x{overlay_height}+0+{y_pos}")
+        self.geometry(f'{w}x{overlay_height}+0+{y_pos}')
 
-        self.label = tk.Label(
-            self, text="", font=("Helvetica", 28),
-            fg=subtitle_color, bg="black",
-            wraplength=w-100, justify="left", anchor="w"
-        )
-        self.label.place(relx=0, rely=0.5, anchor="w", width=w-100, height=overlay_height)
-
+        # Register as an AppBar to reserve space
         self.after(0, lambda: self._register_appbar(self.winfo_id(), overlay_height))
         self._hook_fullscreen()
+
+        self.label = tk.Label(
+            self, text='', font=('Helvetica', 28),
+            fg=subtitle_color, bg='black',
+            wraplength=w-100, justify='left', anchor='w'
+        )
+        self.label.place(relx=0, rely=0.5, anchor='w', width=w-100, height=overlay_height)
 
         self.poll_interval = poll_interval
         self.translate_client = translate.Client()
         self.target_lang = target_lang
-        self.lines = []
+        self.last_sent = ''
         self.after(self.poll_interval, self._poll_queue)
 
     def _register_appbar(self, hwnd, height):
@@ -219,12 +220,12 @@ class SubtitleOverlay(tk.Tk):
 
         class APPBARDATA(ctypes.Structure):
             _fields_ = [
-                ("cbSize", wintypes.DWORD),
-                ("hWnd", wintypes.HWND),
-                ("uCallbackMessage", wintypes.UINT),
-                ("uEdge", wintypes.UINT),
-                ("rc", wintypes.RECT),
-                ("lParam", wintypes.LPARAM),
+                ('cbSize', wintypes.DWORD),
+                ('hWnd', wintypes.HWND),
+                ('uCallbackMessage', wintypes.UINT),
+                ('uEdge', wintypes.UINT),
+                ('rc', wintypes.RECT),
+                ('lParam', wintypes.LPARAM),
             ]
 
         abd = APPBARDATA()
@@ -244,12 +245,11 @@ class SubtitleOverlay(tk.Tk):
         ctypes.windll.shell32.SHAppBarMessage(ABM_SETPOS, ctypes.byref(abd))
 
     def _hook_fullscreen(self):
-        """Every second, shrink any fullscreen window."""
         def shrink_cb(hwnd, _):
             if not win32gui.IsWindowVisible(hwnd):
                 return
             rect = win32gui.GetWindowRect(hwnd)
-            mon = win32api.GetMonitorInfo(win32api.MonitorFromWindow(hwnd))["Monitor"]
+            mon = win32api.GetMonitorInfo(win32api.MonitorFromWindow(hwnd))['Monitor']
             if rect == mon:
                 left, top, right, bottom = mon
                 new_h = (bottom - top) - SLIDE_HEIGHT
@@ -269,29 +269,38 @@ class SubtitleOverlay(tk.Tk):
                 raw = result_queue.get_nowait()
             except queue.Empty:
                 break
-            if raw is not None:
-                latest = raw
+            latest = raw
 
-        if latest:
-            parts = re.split(r'(?<=[.?!])\s+', latest)
-            for sentence in parts:
-                if not sentence:
-                    continue
-                try:
-                    res = self.translate_client.translate(sentence, target_language=self.target_lang)
-                    translated = html.unescape(res.get("translatedText", sentence))
-                except Exception:
-                    translated = sentence
-                new_lines = textwrap.wrap(translated, width=110)
-                self.lines = new_lines[-2:] if len(new_lines) > 2 else new_lines
-                self.label.config(text="\n".join(self.lines))
-                break
+        if not latest:
+            self.after(self.poll_interval, self._poll_queue)
+            return
 
+        # compute only the new delta
+        if latest.startswith(self.last_sent):
+            delta = latest[len(self.last_sent):].strip()
+        else:
+            delta = latest
+        if not delta:
+            self.after(self.poll_interval, self._poll_queue)
+            return
+
+        # translate only the delta
+        try:
+            res = self.translate_client.translate(delta, target_language=self.target_lang)
+            translated = html.unescape(res.get('translatedText', delta))
+        except Exception:
+            translated = delta
+
+        # append translated delta
+        full = (self.label.cget('text') + ' ' + translated).strip()
+        lines = textwrap.wrap(full, width=110)
+        self.label.config(text='\n'.join(lines[-2:]))
+
+        self.last_sent = latest
         self.after(self.poll_interval, self._poll_queue)
 
-
 # ----------------------------------------
-# LIVE MIC STREAM
+# LIVE MIC STREAM and Transcriber (unchanged)
 # ----------------------------------------
 class MicrophoneStream:
     def __init__(self, rate, chunk, device_index=None):
@@ -338,9 +347,6 @@ class MicrophoneStream:
                 data.append(c)
             yield b''.join(data)
 
-# ----------------------------------------
-# TRANSCRIBER THREAD
-# ----------------------------------------
 class Transcriber(threading.Thread):
     def __init__(self, src, tgt, stream_cls, stream_arg):
         super().__init__(daemon=True)
@@ -431,7 +437,7 @@ def main():
         trans.start()
 
         SubtitleOverlay(cfg['subtitle_color'], poll_interval=args.display_interval,
-                        target_lang=cfg['target_lang'], slideshow_hwnd=cfg['slideshow_hwnd']).mainloop()
+                        target_lang=cfg['target_lang']).mainloop()
 
         trans.stop()
         trans.join()
