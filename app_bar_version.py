@@ -7,7 +7,6 @@ import logging
 import html
 import wave
 import argparse
-import re
 import time
 import textwrap
 import ctypes
@@ -195,7 +194,6 @@ class SubtitleOverlay(tk.Tk):
         y_pos = h - overlay_height
         self.geometry(f'{w}x{overlay_height}+0+{y_pos}')
 
-        # Register as an AppBar to reserve space
         self.after(0, lambda: self._register_appbar(self.winfo_id(), overlay_height))
         self._hook_fullscreen()
 
@@ -210,6 +208,8 @@ class SubtitleOverlay(tk.Tk):
         self.translate_client = translate.Client()
         self.target_lang = target_lang
         self.last_sent = ''
+        self.translate_call_count = 0      # ← track number of translate calls
+        self.translate_char_count = 0      # ← track total characters sent
         self.after(self.poll_interval, self._poll_queue)
 
     def _register_appbar(self, hwnd, height):
@@ -275,7 +275,6 @@ class SubtitleOverlay(tk.Tk):
             self.after(self.poll_interval, self._poll_queue)
             return
 
-        # compute only the new delta
         if latest.startswith(self.last_sent):
             delta = latest[len(self.last_sent):].strip()
         else:
@@ -284,14 +283,17 @@ class SubtitleOverlay(tk.Tk):
             self.after(self.poll_interval, self._poll_queue)
             return
 
-        # translate only the delta
+        # count and log translate usage
+        self.translate_call_count += 1
+        self.translate_char_count += len(delta)
+        logging.info(f'Translate API call #{self.translate_call_count}, chars sent: {len(delta)}')
+
         try:
             res = self.translate_client.translate(delta, target_language=self.target_lang)
             translated = html.unescape(res.get('translatedText', delta))
         except Exception:
             translated = delta
 
-        # append translated delta
         full = (self.label.cget('text') + ' ' + translated).strip()
         lines = textwrap.wrap(full, width=110)
         self.label.config(text='\n'.join(lines[-2:]))
@@ -300,7 +302,7 @@ class SubtitleOverlay(tk.Tk):
         self.after(self.poll_interval, self._poll_queue)
 
 # ----------------------------------------
-# LIVE MIC STREAM and Transcriber (unchanged)
+# LIVE MIC STREAM and Transcriber
 # ----------------------------------------
 class MicrophoneStream:
     def __init__(self, rate, chunk, device_index=None):
@@ -356,6 +358,8 @@ class Transcriber(threading.Thread):
         self.stream_arg = stream_arg
         self.stop_event = threading.Event()
         self.speech = speech.SpeechClient()
+        self.api_call_count = 0
+        self.stt_bytes_sent = 0          # ← track total bytes sent
 
     def run(self):
         cfg = speech.RecognitionConfig(
@@ -371,17 +375,22 @@ class Transcriber(threading.Thread):
 
         while not self.stop_event.is_set():
             try:
-                logging.info('Starting new speech stream')
+                self.api_call_count += 1
+                logging.info(f'Streaming session #{self.api_call_count} started')
+
                 mic_ctx = (
                     FileAudioStream(self.stream_arg, RATE, CHUNK)
                     if isinstance(self.stream_arg, str)
                     else MicrophoneStream(RATE, CHUNK, self.stream_arg)
                 )
+
                 with mic_ctx as mic:
-                    requests = (
-                        speech.StreamingRecognizeRequest(audio_content=chunk)
-                        for chunk in mic.generator()
-                    )
+                    def request_gen():
+                        for chunk in mic.generator():
+                            self.stt_bytes_sent += len(chunk)
+                            yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+                    requests = request_gen()
                     for resp in self.speech.streaming_recognize(stream_cfg, requests):
                         if self.stop_event.is_set():
                             break
@@ -391,7 +400,7 @@ class Transcriber(threading.Thread):
                         if text:
                             result_queue.put(text)
                             prefix = 'Final' if resp.results[0].is_final else 'Interim'
-                            logging.info(f'{prefix}: {text}')
+                            logging.debug(f'{prefix}: {text}')
 
             except exceptions.OutOfRange:
                 logging.warning('Stream duration exceeded; restarting')
@@ -406,13 +415,14 @@ class Transcriber(threading.Thread):
                 logging.info('Dev-file complete; stopping Transcriber.')
                 break
 
+        logging.info(f'Total streaming sessions: {self.api_call_count}')
+        logging.info(f'Total STT bytes sent: {self.stt_bytes_sent}')
         logging.info('Transcriber stopped.')
 
     def stop(self):
         self.stop_event.set()
 
 # ----------------------------------------
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dev-file', help='Path to a mono 16-bit 48 kHz WAV')
@@ -421,8 +431,8 @@ def main():
     args = parser.parse_args()
 
     stream_cls = FileAudioStream if args.dev_file else MicrophoneStream
-
     app = QtWidgets.QApplication(sys.argv)
+
     while True:
         dlg = SettingsDialog()
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
@@ -432,12 +442,20 @@ def main():
         keyboard.unhook_all()
         keyboard.add_hotkey(cfg['stop_key'], lambda: os._exit(0))
 
-        stream_arg = args.dev_file or cfg['input_device_index']
-        trans = Transcriber(cfg['source_lang'], cfg['target_lang'], stream_cls, stream_arg)
+        # start STT transcriber
+        trans = Transcriber(cfg['source_lang'], cfg['target_lang'], stream_cls, args.dev_file or cfg['input_device_index'])
         trans.start()
 
-        SubtitleOverlay(cfg['subtitle_color'], poll_interval=args.display_interval,
-                        target_lang=cfg['target_lang']).mainloop()
+        # start overlay (translation)
+        overlay = SubtitleOverlay(
+            cfg['subtitle_color'],
+            poll_interval=args.display_interval,
+            target_lang=cfg['target_lang']
+        )
+        overlay.mainloop()
+
+        logging.info(f'Total translate API calls: {overlay.translate_call_count}')
+        logging.info(f'Total translation characters sent: {overlay.translate_char_count}')
 
         trans.stop()
         trans.join()
