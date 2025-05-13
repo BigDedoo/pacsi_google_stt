@@ -16,6 +16,7 @@ import pyaudio
 import tkinter as tk
 import keyboard
 from PyQt5 import QtWidgets
+from PyQt5.QtCore import Qt
 from google.cloud import speech, translate_v2 as translate
 from google.api_core import exceptions
 
@@ -54,10 +55,11 @@ os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = os.path.join(
 )
 
 RATE = 48000
-DISPLAY_INTERVAL = 1500
+DISPLAY_INTERVAL = 2000
 CHUNK = int(RATE * (DISPLAY_INTERVAL / 1000.0))
 SLIDE_HEIGHT = 140
 
+# now holds tuples (text, detected_lang)
 result_queue = queue.Queue()
 
 # ----------------------------------------
@@ -97,16 +99,18 @@ class SettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle('Settings')
         self.setModal(True)
-        self.resize(400, 250)
+        self.resize(400, 300)
         layout = QtWidgets.QVBoxLayout(self)
 
-        layout.addWidget(QtWidgets.QLabel('Select Translation Direction:'))
-        self.radio_fr_to_en = QtWidgets.QRadioButton('French to English')
-        self.radio_en_to_fr = QtWidgets.QRadioButton('English to French')
+        # Translation direction (now only for default/fallback)
+        layout.addWidget(QtWidgets.QLabel('Default Translation Direction:'))
+        self.radio_fr_to_en = QtWidgets.QRadioButton('French → English')
+        self.radio_en_to_fr = QtWidgets.QRadioButton('English → French')
         self.radio_fr_to_en.setChecked(True)
         layout.addWidget(self.radio_fr_to_en)
         layout.addWidget(self.radio_en_to_fr)
 
+        # Subtitle color
         self.subtitle_color = '#FFFFFF'
         color_layout = QtWidgets.QHBoxLayout()
         color_layout.addWidget(QtWidgets.QLabel('Subtitle Color:'))
@@ -121,6 +125,7 @@ class SettingsDialog(QtWidgets.QDialog):
         color_layout.addWidget(self.color_button)
         layout.addLayout(color_layout)
 
+        # Input device
         layout.addWidget(QtWidgets.QLabel('Select Input Device:'))
         self.input_device_combo = QtWidgets.QComboBox()
         self.devices = {}
@@ -141,19 +146,33 @@ class SettingsDialog(QtWidgets.QDialog):
         p.terminate()
         layout.addWidget(self.input_device_combo)
 
+        # Global stop key
         layout.addWidget(QtWidgets.QLabel('Global Stop Key:'))
         self.stop_key = 'alt+f11'
         self.stop_key_edit = QtWidgets.QLineEdit(self.stop_key)
         self.stop_key_edit.setReadOnly(True)
         layout.addWidget(self.stop_key_edit)
 
+        # Auto-detect languages
+        self.auto_detect_checkbox = QtWidgets.QCheckBox('Auto-detect source language')
+        layout.addWidget(self.auto_detect_checkbox)
+        self.lang_codes_edit = QtWidgets.QLineEdit('fr-FR,en-US')
+        self.lang_codes_edit.setPlaceholderText(
+            'Comma-separated BCP-47 codes (up to 4), e.g. fr-FR,en-US'
+        )
+        self.lang_codes_edit.setEnabled(False)
+        layout.addWidget(self.lang_codes_edit)
+        # FIX: use toggled(bool) so lang_codes_edit.enable follows the checkbox state
+        self.auto_detect_checkbox.toggled.connect(self.lang_codes_edit.setEnabled)
+
+        # OK / Cancel
         btn_layout = QtWidgets.QHBoxLayout()
         ok = QtWidgets.QPushButton('OK')
         ok.clicked.connect(self.accept)
         btn_layout.addWidget(ok)
         cancel = QtWidgets.QPushButton('Cancel')
         cancel.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel)
+        btn_layout.addLayout(btn_layout)
         layout.addLayout(btn_layout)
 
     def choose_color(self):
@@ -165,26 +184,30 @@ class SettingsDialog(QtWidgets.QDialog):
             )
 
     def get_settings(self):
-        direction = ('fr-FR', 'en') if self.radio_fr_to_en.isChecked() else ('en-US', 'fr-FR')
+        default_src = 'fr-FR' if self.radio_fr_to_en.isChecked() else 'en-US'
+        default_tgt = 'en'    if self.radio_fr_to_en.isChecked() else 'fr-FR'
+        codes = [c.strip() for c in self.lang_codes_edit.text().split(',') if c.strip()]
         return {
-            'source_lang': direction[0],
-            'target_lang': direction[1],
+            'default_src': default_src,
+            'default_tgt': default_tgt,
             'subtitle_color': self.subtitle_color,
             'input_device_index': self.devices.get(self.input_device_combo.currentText()),
             'stop_key': self.stop_key,
+            'auto_detect': self.auto_detect_checkbox.isChecked(),
+            'language_codes': codes
         }
 
 # ----------------------------------------
-# OVERLAY WINDOW with AppBar + Delta Translation
+# OVERLAY WINDOW with AppBar + Dynamic Translation
 # ----------------------------------------
 class SubtitleOverlay(tk.Tk):
-    def __init__(self, subtitle_color, poll_interval, target_lang):
+    def __init__(self, subtitle_color, poll_interval, default_tgt):
         super().__init__()
         self.overrideredirect(True)
         self.attributes('-topmost', True)
         self.config(bg='black')
         try:
-            self.wm_attributes('-transparentcolor', 'black')
+            self.wm_attributes('black')
         except tk.TclError:
             pass
 
@@ -206,10 +229,10 @@ class SubtitleOverlay(tk.Tk):
 
         self.poll_interval = poll_interval
         self.translate_client = translate.Client()
-        self.target_lang = target_lang
+        self.default_tgt = default_tgt
         self.last_sent = ''
-        self.translate_call_count = 0      # ← track number of translate calls
-        self.translate_char_count = 0      # ← track total characters sent
+        self.translate_call_count = 0
+        self.translate_char_count = 0
         self.after(self.poll_interval, self._poll_queue)
 
     def _register_appbar(self, hwnd, height):
@@ -217,7 +240,6 @@ class SubtitleOverlay(tk.Tk):
         ABM_QUERYPOS = 0x00000002
         ABM_SETPOS = 0x00000003
         ABE_BOTTOM = 3
-
         class APPBARDATA(ctypes.Structure):
             _fields_ = [
                 ('cbSize', wintypes.DWORD),
@@ -227,14 +249,11 @@ class SubtitleOverlay(tk.Tk):
                 ('rc', wintypes.RECT),
                 ('lParam', wintypes.LPARAM),
             ]
-
         abd = APPBARDATA()
         abd.cbSize = ctypes.sizeof(abd)
         abd.hWnd = hwnd
         abd.uEdge = ABE_BOTTOM
-
         ctypes.windll.shell32.SHAppBarMessage(ABM_NEW, ctypes.byref(abd))
-
         screen_w = ctypes.windll.user32.GetSystemMetrics(0)
         screen_h = ctypes.windll.user32.GetSystemMetrics(1)
         abd.rc.left = 0
@@ -248,33 +267,34 @@ class SubtitleOverlay(tk.Tk):
         def shrink_cb(hwnd, _):
             if not win32gui.IsWindowVisible(hwnd):
                 return
-            rect = win32gui.GetWindowRect(hwnd)
-            mon = win32api.GetMonitorInfo(win32api.MonitorFromWindow(hwnd))['Monitor']
-            if rect == mon:
-                left, top, right, bottom = mon
-                new_h = (bottom - top) - SLIDE_HEIGHT
-                win32gui.SetWindowPos(
-                    hwnd, None,
-                    left, top,
-                    right - left, new_h,
-                    win32con.SWP_NOZORDER
-                )
+            try:
+                rect = win32gui.GetWindowRect(hwnd)
+                mon_handle = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+                mon = win32api.GetMonitorInfo(mon_handle).get('Monitor')
+                if rect == mon:
+                    left, top, right, bottom = mon
+                    new_h = (bottom - top) - SLIDE_HEIGHT
+                    win32gui.SetWindowPos(hwnd, None, left, top, right-left, new_h, win32con.SWP_NOZORDER)
+            except Exception:
+                pass
         win32gui.EnumWindows(shrink_cb, None)
         self.after(1000, self._hook_fullscreen)
 
     def _poll_queue(self):
         latest = None
+        detected = None
         while True:
             try:
-                raw = result_queue.get_nowait()
+                raw, lang = result_queue.get_nowait()
+                latest, detected = raw, lang
             except queue.Empty:
                 break
-            latest = raw
 
         if not latest:
             self.after(self.poll_interval, self._poll_queue)
             return
 
+        # compute delta
         if latest.startswith(self.last_sent):
             delta = latest[len(self.last_sent):].strip()
         else:
@@ -283,13 +303,19 @@ class SubtitleOverlay(tk.Tk):
             self.after(self.poll_interval, self._poll_queue)
             return
 
-        # count and log translate usage
+        # pick target: flip french<->english
+        tgt = self.default_tgt
+        if detected.startswith('fr'):
+            tgt = 'en'
+        elif detected.startswith('en'):
+            tgt = 'fr-FR'
+
         self.translate_call_count += 1
         self.translate_char_count += len(delta)
-        logging.info(f'Translate API call #{self.translate_call_count}, chars sent: {len(delta)}')
+        logging.info(f'Translate API call #{self.translate_call_count}, chars {len(delta)}, detected={detected}')
 
         try:
-            res = self.translate_client.translate(delta, target_language=self.target_lang)
+            res = self.translate_client.translate(delta, target_language=tgt)
             translated = html.unescape(res.get('translatedText', delta))
         except Exception:
             translated = delta
@@ -350,27 +376,47 @@ class MicrophoneStream:
             yield b''.join(data)
 
 class Transcriber(threading.Thread):
-    def __init__(self, src, tgt, stream_cls, stream_arg):
+    def __init__(self, default_src, default_tgt, stream_cls, stream_arg,
+                 auto_detect=False, language_codes=None):
         super().__init__(daemon=True)
-        self.src = src
-        self.tgt = tgt
+        self.default_src = default_src
+        self.default_tgt = default_tgt
         self.stream_cls = stream_cls
         self.stream_arg = stream_arg
+        self.auto_detect = auto_detect
+        self.language_codes = language_codes or []
         self.stop_event = threading.Event()
         self.speech = speech.SpeechClient()
         self.api_call_count = 0
-        self.stt_bytes_sent = 0          # ← track total bytes sent
+        self.stt_bytes_sent = 0
 
     def run(self):
-        cfg = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=RATE,
-            language_code=self.src,
-            enable_automatic_punctuation=True,
-            enable_word_confidence=True,
-            model='phone_call',
-            use_enhanced=True
-        )
+        # build config
+        if self.auto_detect and self.language_codes:
+            primary = self.language_codes[0]
+            alternatives = self.language_codes[1:]
+            cfg = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=RATE,
+                language_code=primary,
+                alternative_language_codes=alternatives,
+                enable_automatic_punctuation=True,
+                enable_word_confidence=True,
+                model='phone_call',
+                use_enhanced=True
+            )
+            logging.info(f'Auto-detect enabled; langs={self.language_codes}')
+        else:
+            cfg = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=RATE,
+                language_code=self.default_src,
+                enable_automatic_punctuation=True,
+                enable_word_confidence=True,
+                model='phone_call',
+                use_enhanced=True
+            )
+
         stream_cfg = speech.StreamingRecognitionConfig(config=cfg, interim_results=True)
 
         while not self.stop_event.is_set():
@@ -390,17 +436,17 @@ class Transcriber(threading.Thread):
                             self.stt_bytes_sent += len(chunk)
                             yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-                    requests = request_gen()
-                    for resp in self.speech.streaming_recognize(stream_cfg, requests):
+                    for resp in self.speech.streaming_recognize(stream_cfg, request_gen()):
                         if self.stop_event.is_set():
                             break
                         if not resp.results or not resp.results[0].alternatives:
                             continue
                         text = resp.results[0].alternatives[0].transcript.strip()
+                        lang = resp.results[0].language_code
                         if text:
-                            result_queue.put(text)
+                            result_queue.put((text, lang))
                             prefix = 'Final' if resp.results[0].is_final else 'Interim'
-                            logging.debug(f'{prefix}: {text}')
+                            logging.debug(f'{prefix} ({lang}): {text}')
 
             except exceptions.OutOfRange:
                 logging.warning('Stream duration exceeded; restarting')
@@ -442,15 +488,18 @@ def main():
         keyboard.unhook_all()
         keyboard.add_hotkey(cfg['stop_key'], lambda: os._exit(0))
 
-        # start STT transcriber
-        trans = Transcriber(cfg['source_lang'], cfg['target_lang'], stream_cls, args.dev_file or cfg['input_device_index'])
+        trans = Transcriber(
+            cfg['default_src'], cfg['default_tgt'],
+            stream_cls, args.dev_file or cfg['input_device_index'],
+            auto_detect=cfg['auto_detect'],
+            language_codes=cfg['language_codes']
+        )
         trans.start()
 
-        # start overlay (translation)
         overlay = SubtitleOverlay(
             cfg['subtitle_color'],
             poll_interval=args.display_interval,
-            target_lang=cfg['target_lang']
+            default_tgt=cfg['default_tgt']
         )
         overlay.mainloop()
 
