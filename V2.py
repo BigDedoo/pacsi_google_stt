@@ -79,6 +79,9 @@ LANG_OPTIONS = [
     ('Spanish (Spain)', 'es-ES'),
     ('Italian (Italy)', 'it-IT'),
     ('German (Germany)', 'de-DE'),
+    ('Ukrainian (Ukraine)', 'uk-UA'),
+    ('English (Australia)', 'en-AU'),
+    ('English (UK)', 'en-GB'),
 ]
 
 # ----------------------------------------
