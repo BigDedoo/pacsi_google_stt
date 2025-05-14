@@ -15,12 +15,11 @@ from ctypes import wintypes
 import pyaudio
 import tkinter as tk
 import keyboard
-from PyQt5 import QtWidgets, QtGui
+from PyQt5 import QtWidgets
 
 # V2 imports
 from google.cloud.speech_v2 import SpeechClient
 from google.cloud.speech_v2.types import cloud_speech as cloud_speech_types
-
 from google.cloud import translate_v2 as translate
 from google.api_core import exceptions
 
@@ -73,15 +72,15 @@ LANG_OPTIONS = [
     ('French (France)', 'fr-FR'),
     ('English (US)', 'en-US'),
     ('English (Hong Kong)', 'en-HK'),
+    ('English (UK)', 'en-GB'),
+    ('English (Australia)', 'en-AU'),
     ('English (India)', 'en-IN'),
+    ('Ukrainian (Ukraine)', 'uk-UA'),
     ('Russian (Russia)', 'ru-RU'),
     ('Japanese (Japan)', 'ja-JP'),
     ('Spanish (Spain)', 'es-ES'),
     ('Italian (Italy)', 'it-IT'),
     ('German (Germany)', 'de-DE'),
-    ('Ukrainian (Ukraine)', 'uk-UA'),
-    ('English (Australia)', 'en-AU'),
-    ('English (UK)', 'en-GB'),
 ]
 
 # ----------------------------------------
@@ -114,91 +113,98 @@ class FileAudioStream:
             time.sleep(seconds_per_chunk)
 
 # ----------------------------------------
-# SETTINGS DIALOG (PyQt5)
+# SETTINGS DIALOG (PyQt5) – radio buttons
 # ----------------------------------------
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Settings')
+        self.setWindowTitle('PACSI - Python Audio Conversion & Speech Interface')
         self.setModal(True)
-        self.resize(400, 250)
+        self.resize(410, 320)
         layout = QtWidgets.QVBoxLayout(self)
 
-        # speaker language picker
-        layout.addWidget(QtWidgets.QLabel('Speaker Language:'))
-        self.src_combo = QtWidgets.QComboBox()
-        for name, code in LANG_OPTIONS:
-            self.src_combo.addItem(name, code)
-        layout.addWidget(self.src_combo)
-
-        # translation language picker
-        layout.addWidget(QtWidgets.QLabel('Translate To:'))
-        self.tgt_combo = QtWidgets.QComboBox()
-        for name, code in LANG_OPTIONS:
-            self.tgt_combo.addItem(name, code)
-        self.tgt_combo.setCurrentIndex(1)  # default to English (US)
-        layout.addWidget(self.tgt_combo)
-
-        # subtitle color
-        layout.addWidget(QtWidgets.QLabel('Subtitle Color:'))
-        color_layout = QtWidgets.QHBoxLayout()
-        self.color_preview = QtWidgets.QLabel()
-        self.color_preview.setFixedSize(40, 20)
+        # default subtitle color (white)
         self.subtitle_color = '#FFFFFF'
-        self.color_preview.setStyleSheet(
-            f'background-color: {self.subtitle_color}; border: 1px solid black;'
-        )
-        color_layout.addWidget(self.color_preview)
-        choose_color = QtWidgets.QPushButton('Choose...')
-        choose_color.clicked.connect(self.choose_color)
-        color_layout.addWidget(choose_color)
-        layout.addLayout(color_layout)
 
-        # input device
+        # --- Speaker Language (grid of radio buttons) ---
+        self.src_group = QtWidgets.QButtonGroup(self)
+        src_box = QtWidgets.QGroupBox('Speaker Language:')
+        src_layout = QtWidgets.QGridLayout(src_box)
+        max_rows = 5
+        self.src_radios = []
+        for idx, (name, code) in enumerate(LANG_OPTIONS):
+            row = idx % max_rows
+            col = idx // max_rows
+            rb = QtWidgets.QRadioButton(name)
+            rb.language_code = code
+            src_layout.addWidget(rb, row, col)
+            self.src_group.addButton(rb)
+            self.src_radios.append(rb)
+        # default to English (US)
+        for rb in self.src_radios:
+            if rb.language_code == 'fr-FR':
+                rb.setChecked(True)
+                break
+        layout.addWidget(src_box)
+
+        # --- Translate To (grid of radio buttons) ---
+        self.tgt_group = QtWidgets.QButtonGroup(self)
+        tgt_box = QtWidgets.QGroupBox('Translate To:')
+        tgt_layout = QtWidgets.QGridLayout(tgt_box)
+        self.tgt_radios = []
+        for idx, (name, code) in enumerate(LANG_OPTIONS):
+            row = idx % max_rows
+            col = idx // max_rows
+            rb = QtWidgets.QRadioButton(name)
+            rb.language_code = code
+            tgt_layout.addWidget(rb, row, col)
+            self.tgt_group.addButton(rb)
+            self.tgt_radios.append(rb)
+        # default to English (US)
+        for rb in self.tgt_radios:
+            if rb.language_code == 'en-US':
+                rb.setChecked(True)
+                break
+        layout.addWidget(tgt_box)
+
+        # --- Input Device ---
         layout.addWidget(QtWidgets.QLabel('Select Input Device:'))
         self.input_combo = QtWidgets.QComboBox()
-        p = pyaudio.PyAudio()
+        pa = pyaudio.PyAudio()
         default = None
         try:
-            default = p.get_default_input_device_info().get('name')
+            default = pa.get_default_input_device_info().get('name')
         except:
             pass
-        for i in range(p.get_device_count()):
-            info = p.get_device_info_by_index(i)
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
             if info.get('maxInputChannels', 0) > 0:
-                name = info['name']
-                self.input_combo.addItem(name, i)
-                if name == default:
+                self.input_combo.addItem(info['name'], i)
+                if info['name'] == default:
                     self.input_combo.setCurrentIndex(self.input_combo.count() - 1)
-        p.terminate()
+        pa.terminate()
         layout.addWidget(self.input_combo)
 
-        # stop key
+        # --- Global Stop Key ---
         layout.addWidget(QtWidgets.QLabel('Global Stop Key:'))
         self.stop_key = 'alt+f11'
         stop_edit = QtWidgets.QLineEdit(self.stop_key)
         stop_edit.setReadOnly(True)
         layout.addWidget(stop_edit)
 
-        # OK/Cancel
+        # --- OK / Cancel ---
         btns = QtWidgets.QHBoxLayout()
         ok = QtWidgets.QPushButton('OK'); ok.clicked.connect(self.accept)
         cancel = QtWidgets.QPushButton('Cancel'); cancel.clicked.connect(self.reject)
         btns.addWidget(ok); btns.addWidget(cancel)
         layout.addLayout(btns)
 
-    def choose_color(self):
-        color = QtWidgets.QColorDialog.getColor(parent=self)
-        if color.isValid():
-            self.subtitle_color = color.name()
-            self.color_preview.setStyleSheet(
-                f'background-color: {self.subtitle_color}; border: 1px solid black;'
-            )
-
     def get_settings(self):
+        src_code = next(rb.language_code for rb in self.src_radios if rb.isChecked())
+        tgt_code = next(rb.language_code for rb in self.tgt_radios if rb.isChecked())
         return {
-            'src_language': self.src_combo.currentData(),
-            'tgt_language': self.tgt_combo.currentData(),
+            'src_language': src_code,
+            'tgt_language': tgt_code,
             'subtitle_color': self.subtitle_color,
             'input_device_index': self.input_combo.currentData(),
             'stop_key': self.stop_key,
@@ -271,7 +277,8 @@ class SubtitleOverlay(tk.Tk):
             if not win32gui.IsWindowVisible(hwnd):
                 return
             r = win32gui.GetWindowRect(hwnd)
-            mon = win32api.GetMonitorInfo(win32api.MonitorFromWindow(hwnd))['Monitor']
+            mon = win32api.GetMonitorInfo(
+                win32api.MonitorFromWindow(hwnd))['Monitor']
             if r == mon:
                 l, t, rw, b = mon
                 win32gui.SetWindowPos(
@@ -302,7 +309,7 @@ class SubtitleOverlay(tk.Tk):
         logging.info(f'Translate API call #{self.translate_call_count}, chars sent: {len(text)}')
 
         try:
-            res = self.translate_client.translate(text, target_language=self.fixed_tgt)
+            res = self.translate_client.translate(text, target_language= self.fixed_tgt)
             translated = html.unescape(res.get('translatedText', text))
         except Exception:
             translated = text
@@ -369,7 +376,7 @@ class MicrophoneStream:
             yield b''.join(buff)
 
 # ----------------------------------------
-# TRANSCRIBER USING V2 API (with chunk splitting + stability filter)
+# TRANSCRIBER USING V2 API
 # ----------------------------------------
 class Transcriber(threading.Thread):
     def __init__(self, stream_cls, stream_arg, src_language, project_id, recognizer_id):
@@ -400,9 +407,7 @@ class Transcriber(threading.Thread):
                 interim_results=True
             ),
         )
-        recognizer_name = (
-            f"projects/{self.project_id}/locations/global/recognizers/{self.recognizer_id}"
-        )
+        recognizer_name = f"projects/{self.project_id}/locations/global/recognizers/{self.recognizer_id}"
         config_request = cloud_speech_types.StreamingRecognizeRequest(
             recognizer=recognizer_name,
             streaming_config=streaming_config,
@@ -439,13 +444,10 @@ class Transcriber(threading.Thread):
                             is_final = result.is_final
                             stability = result.stability
 
-                            # skip low-stability interim results
                             if not is_final and stability < STABILITY_THRESHOLD:
                                 continue
 
-                            logging.info(
-                                f"Transcript: {transcript!r} | final={is_final} | stability={stability:.2f}"
-                            )
+                            logging.info(f"Transcript: {transcript!r} | final={is_final} | stability={stability:.2f}")
                             result_queue.put((transcript, is_final))
 
             except exceptions.OutOfRange:
@@ -455,9 +457,7 @@ class Transcriber(threading.Thread):
                 logging.error(f"Transcriber V2 error: {e}")
                 time.sleep(0.5)
 
-        logging.info(
-            f"Total V2 sessions: {self.api_call_count}, bytes sent: {self.stt_bytes_sent}"
-        )
+        logging.info(f"Total V2 sessions: {self.api_call_count}, bytes sent: {self.stt_bytes_sent}")
 
     def stop(self):
         self.stop_event.set()
